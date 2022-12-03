@@ -1,0 +1,7 @@
+{
+  "name": "hardhat-project",
+  "dependencies": {
+    "@aave/core-v3": "^1.16.2-beta.1",
+    "dotenv": "^16.0.3"
+  }
+}
