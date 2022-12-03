@@ -14,13 +14,13 @@ contract Flashloan is FlashLoanSimpleReceiverBase {
         owner = payable(msg.sender);
     }
 
-    function executeOperation(
+  function executeOperation(
     address asset,
     uint256 amount,
     uint256 premium,
     address initiator,
     bytes calldata params
-  ) external override returns (bool) {
+    ) external override returns (bool) {
     // We have funds in the contract && any logic can be practiced
     uint256 amountOwned = amount + premiums;
     IERC20(asset).approve(address(POOL), amountOwned);
@@ -29,7 +29,33 @@ contract Flashloan is FlashLoanSimpleReceiverBase {
   }
 
   function requestFlashloan() public {
-    
+    address receiverAddress = address(this);
+    address asset = _token;
+    uint256 amount = _amount;
+    bytes memory params ="";
+    uint16 referralCode = 0;
+
+    POOL.flashloanSimple(
+      receiverAddress,
+      assets,
+      amounts,
+      params,
+      referralCode
+    );
   }
 
-}
+  function getBalance(address _tokenAddress) external view returns (uint256) {
+    return IERC20(_tokenAddress).balanceOf(address(this));
+  }
+
+  function withdraw(address _tokenAddress) external onlyOwner {
+    IERC20 token = IERC20(_tokenAddress);
+    token.transfer(msg.sender, token.balanceOf(address(this)));
+  }
+
+  modifier onlyOwner() {
+    require(msg.sender == owner, "Only the contract owner can call this function");
+    _; 
+  }
+
+  receive() external payable {}
