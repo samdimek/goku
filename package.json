@@ -3,5 +3,9 @@
   "dependencies": {
     "@aave/core-v3": "^1.16.2-beta.1",
     "dotenv": "^16.0.3"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-toolbox": "^5.0.0",
+    "hardhat": "^2.29.1"
   }
 }
