@@ -505,3 +505,6 @@ describe("CalldataArbStrategy", function () {
     ).to.be.revertedWithCustomError(calldataStrategy, "NotEngine");
   });
 });
+
+// Reused by test/scanner.js so the scanner tests drive the exact same market.
+module.exports = { baseFixture };

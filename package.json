@@ -1,5 +1,16 @@
 {
   "name": "hardhat-project",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "deploy:local": "hardhat run scripts/deployFlashLoan.js",
+    "deploy:sepolia": "hardhat run scripts/deployFlashLoan.js --network sepolia",
+    "scan:demo": "hardhat run scanner/demoLocal.js",
+    "scan": "hardhat run scanner/index.js",
+    "scan:sepolia": "hardhat run scanner/index.js --network sepolia",
+    "ledger": "hardhat run scanner/ledger.js",
+    "ledger:sepolia": "hardhat run scanner/ledger.js --network sepolia"
+  },
   "dependencies": {
     "@aave/core-v3": "^1.16.2-beta.1",
     "dotenv": "^16.0.3"
@@ -8,4 +19,4 @@
     "@nomicfoundation/hardhat-toolbox": "^5.0.0",
     "hardhat": "^2.29.1"
   }
-}
+}

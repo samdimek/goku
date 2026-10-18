@@ -16,6 +16,19 @@ contract MockRouter {
         bonusBps = bonusBps_;
     }
 
+    /// @notice V2-compatible quoter so the scanner can price routes locally:
+    ///          pays this router's bonus on top of amountIn (1:1 base rate).
+    function getAmountsOut(uint256 amountIn, address[] calldata path)
+        external
+        view
+        returns (uint256[] memory amounts)
+    {
+        require(path.length >= 2, "BAD_PATH");
+        amounts = new uint256[](path.length);
+        amounts[0] = amountIn;
+        amounts[amounts.length - 1] = amountIn + (amountIn * bonusBps) / BPS;
+    }
+
     function swapExactTokensForTokens(
         uint256 amountIn,
         uint256 amountOutMin,

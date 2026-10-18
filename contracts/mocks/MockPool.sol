@@ -17,6 +17,12 @@ contract MockPool {
         premiumBps = premiumBps_;
     }
 
+    /// @notice Same getter Aave's Pool exposes, so the scanner reads the real
+    ///         premium instead of hard-coding it.
+    function FLASHLOAN_PREMIUM_TOTAL() external view returns (uint128) {
+        return uint128(premiumBps);
+    }
+
     function flashLoanSimple(
         address receiverAddress,
         address asset,

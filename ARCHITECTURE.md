@@ -29,7 +29,7 @@ Constraints chosen for this project:
 
 ## 2. Component map
 
-```
+```text
 contracts/
 ├── FlashLoan.sol                    ← ENGINE: Aave receiver + strategy registry
 │                                      + owner/keeper auth + atomic profit guard
@@ -43,9 +43,19 @@ contracts/
     ├── DexRouteArbStrategy.sol      approaches #1 + #2 (two-DEX, multi-hop cycle)
     └── CalldataArbStrategy.sol      approach #3 (aggregator / universal-router calldata)
 
+scanner/                             ← OFF-CHAIN SCANNER (the bot half)
+├── index.js                         polling CLI: quote → evaluate → staticCall → send
+├── demoLocal.js                     offline end-to-end demo on the hardhat network
+├── config.example.json              copy to config.json; venues, pairs, thresholds
+└── lib/
+    ├── abi.js                       minimale ABI fragments (router/engine/pool)
+    ├── core.js                      pure logic: cycle validation, profit math,
+    │                                slippage pins, route-param encoding
+    └── scan.js                      on-chain quoting, gas pricing, simulation, send
+
 scripts/deployFlashLoan.js           deploys engine + both strategies, registers them
-test/FlashLoan.js                    24 tests covering the engine and both strategies
-mocks (contracts/mocks/)             MockPool, MockERC20, MockRouter, MockStrategy…
+test/{FlashLoan,scanner}.js         40 tests: contracts + scanner (unit & e2e)
+mocks (contracts/mocks/)             MockPool, MockERC20, MockRouter (with quoter)
 ```
 
 ### Why the engine/strategy split
@@ -96,19 +106,51 @@ All three share one rule: **the borrowed asset must come back to the engine**,
 converted by the route itself. The engine never accepts "profit in another
 token" — a route that ends in a different token simply cannot repay and reverts.
 
-### Off-chain counterpart (the other half of the bot)
+### Off-chain counterpart — **built: `scanner/`**
 
-On-chain contract ≠ profitable bot. You still need a scanner process that:
+The scanner (`scanner/index.js`, run with `npx hardhat run scanner/index.js
+--network sepolia` or `npm run scan:sepolia`) implements the loop described in
+this document:
 
-1. Watches pools/DEXes (or polls aggregator quotes: 1inch/0x/Odos) for
-   executable price gaps — **quoted spot price ≠ executable output**, always
-   simulate with `amountsOut`/quoters.
-2. Estimates gas for the whole tx and requires expected surplus >
-   premium (0.05%) + swap fees + gas — the on-chain `minProfit` guard is the
-   last line of defense, not the profit filter.
-3. Calls `requestFlashLoan` from the owner/keeper EOA — ideally through a
-   private relay (Flashbots Protect) so sandwich bots don't see it coming,
-   with route-level `minAmountOut` slippage pins on every leg.
+1. **Quote**: for each configured opportunity, both legs are priced through the
+   routers' `getAmountsOut` (quoted output ≈ executable output for V2 pools;
+   always re-checked on-chain before sending).
+2. **Price the loan**: premium is *read from the pool*
+   (`FLASHLOAN_PREMIUM_TOTAL()`), never hard-coded — Aave governance can change it.
+3. **Price the gas**: `requestFlashLoan.estimateGas` × `eth_gasPrice`; when the
+   borrowed asset is the wrapped-native (config `wrappedAsset`), gas is netted
+   directly out of the profit decision, so a "profitable" trade that costs more
+   than it earns is never sent. Off-chain margin = per-opportunity `minProfitWei`.
+4. **Simulate**: `requestFlashLoan.staticCall(...)` executes the entire flash
+   loan against current state — the same atomic guard the chain enforces — and
+   failure marks the opportunity unsent instead of burning gas.
+5. **Send**: only with `SEND=true`. Optionally over a private relay
+   (`SUBMIT_RPC_URL`, e.g. Flashbots Protect) so sandwich bots never see the
+   transaction. Each leg carries slippage pins (`slippageBps`) as `minAmountOut`.
+
+Safety defaults: **dry-run unless `SEND=true`**, `SCANNER_ONCE=true` for a single
+pass, per-opportunity errors are reported rather than crashing the loop, and
+invalid cycles are rejected by `core.validateCycle` before any RPC call.
+
+### Ops layer — **built: alerts + P&L ledger**
+
+- **Alerts** (`scanner/lib/alert.js`, wired into the scan loop): when a cycle
+  yields a profitable opportunity, a POST-JSON payload (mode, per-opportunity
+  profit, tx hash) goes to `ALERT_WEBHOOK_URL` (env, wins) or
+  `alerts.webhookUrl` (config). Dry-run cycles stay silent unless
+  `alerts.onDryRun: true`. The notifier never throws — a failed webhook logs and
+  the loop continues. Payloads are dry-run/`send`-aware; unit-tested via an
+  injected transport.
+- **P&L ledger** (`npm run ledger`): aggregates `FlashLoanRequested`,
+  `FlashLoanExecuted` and `Withdrawn` events in configurable block chunks into
+  per-asset (borrowed / premium / gross profit / withdrawn / **retained in
+  contract**) and per-strategy rows, rendered with per-token decimals. This is
+  the accounting feed for the "is the bot actually profitable?" question and
+  the alert in §7.4. Reverted trades emit no events — by design they moved no
+  funds.
+
+`npm run scan:demo` runs the whole path offline against a mock market with a
+deliberate 1.2% price gap and asserts the exact realized profit.
 
 ## 5. Security model
 
@@ -147,7 +189,25 @@ Override for forks/new markets with `POOL_ADDRESSES_PROVIDER` in `.env`
 npx hardhat compile
 npx hardhat test
 npx hardhat run scripts/deployFlashLoan.js --network sepolia
+
+npm run scan:demo                  # offline end-to-end scanner demo
+npm test                           # 40 tests (contracts + scanner)
+cp scanner/config.example.json scanner/config.json   # then fill in addresses
+npm run scan                       # dry-run scanner loop (local/network)
+npm run scan:sepolia               # dry-run on Sepolia
+SEND=true npm run scan:sepolia     # actually trade (needs funded key + registered modules)
+SCANNER_ONCE=true npm run scan:sepolia   # single pass, then exit
+npm run ledger:sepolia             # P&L report for the deployed engine
 ```
+
+Alert webhook: set `ALERT_WEBHOOK_URL` in `.env` (or `alerts.webhookUrl` in
+config) to a Slack/Discord/Telegram bridge; ledger range/chunk/decimals live
+under `ledger` in `scanner/config.json`.
+
+Scanner configuration lives in `.env` (`SEPOLIA_RPC_URL`, `PRIVATE_KEY`,
+optional `ENGINE_ADDRESS` / `ROUTE_STRATEGY_ADDRESS` / `SUBMIT_RPC_URL`
+overrides) and `scanner/config.json` (venues, opportunity pairs, `amountIn`,
+`minProfitWei`, `slippageBps`, `wrappedNativeAsset` for gas accounting).
 
 Post-deploy (owner only), as printed by the script:
 
@@ -166,6 +226,7 @@ engine.setMinProfitFloor(<wei>, ...)                  // optional
    Flashbots with `minProfit` set from simulation.
 3. **Mainnet deploy**: `POOL_ADDRESSES_PROVIDER` already defaults to mainnet
    under `--network mainnet`; keep `registerStrategy` limited to audited modules.
-4. **Audit + monitoring**: `FlashLoanRequested` / `FlashLoanExecuted(profit)`
-   events are the bot's P&L feed; alert if profit is repeatedly 0 (keeps paying
-   gas on doomed routes).
+4. **Audit + monitoring**: `npm run ledger` already renders the
+   `FlashLoanRequested` / `FlashLoanExecuted(profit)` feed as per-asset and
+   per-strategy P&L, and the alert hook fires on profitable cycles — extend it
+   to also warn when profit is repeatedly 0 (keeps paying gas on doomed routes).

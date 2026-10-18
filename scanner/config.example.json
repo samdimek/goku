@@ -1,0 +1,47 @@
+{
+  "_comment": "Copy to scanner/config.json (or point SCANNER_CONFIG at a file) and fill in real addresses. Every cycle is a closed 2-leg route: leg N's output token must equal leg N+1's input token, and the cycle must start and end in borrowAsset.",
+  "pollIntervalMs": 12000,
+  "deadlineSecs": 120,
+  "defaultSlippageBps": 50,
+  "defaultAmountIn": "1000000000000000000",
+  "defaultMinProfitWei": "0",
+  "engineAddress": "0x0000000000000000000000000000000000000000",
+  "routeStrategyAddress": "0x0000000000000000000000000000000000000000",
+  "wrappedNativeAsset": "0x0000000000000000000000000000000000000000",
+  "_gasAccounting": "Set wrappedNativeAsset (e.g. WETH) so gas cost, quoted in wei, is netted out of the profit decision. Leave zero address to ignore gas off-chain (the engine's on-chain minProfit guard still applies).",
+  "submitRpcUrl": "",
+  "_submitRpc": "Optional private/mempool-hiding RPC used ONLY for sending (e.g. https://protect.flashbots.net). Quotes still come from the main RPC.",
+  "legSlippageBps": {},
+  "alerts": {
+    "webhookUrl": "",
+    "onDryRun": false,
+    "_comment": "POST JSON to a Slack/Discord/Telegram bridge on profitable cycles. Prefer ALERT_WEBHOOK_URL in .env (secret). onDryRun=true also alerts when not sending."
+  },
+  "ledger": {
+    "fromBlock": 0,
+    "chunk": 5000,
+    "decimalsByAsset": {},
+    "_comment": "scanner/ledger.js settings: block range for event scanning (LEDGER_FROM_BLOCK/LEDGER_TO_BLOCK override), eth_getLogs chunking, and per-token decimals (default 18)."
+  },
+  "opportunities": [
+    {
+      "id": "weth-usdc-venueA-vs-venueB",
+      "borrowAsset": "0x0000000000000000000000000000000000000000",
+      "amountIn": "1000000000000000000",
+      "minProfitWei": "10000000000000000",
+      "slippageBps": 30,
+      "minGasCostWei": "0",
+      "_legs": "2 legs; each leg = router address + hop path",
+      "legs": [
+        {
+          "router": "0x0000000000000000000000000000000000000000",
+          "path": ["0x0000000000000000000000000000000000000000", "0x0000000000000000000000000000000000000001"]
+        },
+        {
+          "router": "0x0000000000000000000000000000000000000001",
+          "path": ["0x0000000000000000000000000000000000000001", "0x0000000000000000000000000000000000000000"]
+        }
+      ]
+    }
+  ]
+}
