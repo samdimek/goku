@@ -233,6 +233,14 @@ describe("scanner end-to-end (local mock market)", function () {
     expect(results[0].status).to.equal("confirmed");
     expect(results[0].txHash).to.be.a("string");
 
+    // Receipt facts recorded for post-run analysis (actual, not estimated).
+    expect(results[0].blockNumber).to.be.a("number");
+    expect(Number(results[0].gasUsed)).to.be.greaterThan(21000);
+    expect(BigInt(results[0].gasCostWei)).to.equal(
+      BigInt(results[0].gasUsed) * BigInt(results[0].gasPriceUsed)
+    );
+    expect(results[0].confirmMs).to.be.a("number");
+
     // out 1012 - principal 1000 - premium 0.5 => 11.5
     const engine = await ethers.getContractAt("FlashLoan", engineAddress);
     expect(await engine.getBalance(assetAddr)).to.equal(E("11.5"));

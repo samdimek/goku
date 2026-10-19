@@ -9,3 +9,6 @@ typechain-types
 cache
 artifacts
 
+# Test-run artifacts (JSONL logs, CSV, reports)
+results
+

@@ -170,6 +170,7 @@ async function scanOnce({ provider, signer, engineAddress, strategyAddress, conf
       }
 
       if (!signer) throw new Error("send=true requires a signer");
+      const t0 = Date.now();
       const tx = await engine.requestFlashLoan(
         opp.borrowAsset, amountIn, strategyAddress, evalr.minProfit, strategyParams
       );
@@ -177,8 +178,22 @@ async function scanOnce({ provider, signer, engineAddress, strategyAddress, conf
       const receipt = await tx.wait();
       item.blockNumber = receipt.blockNumber;
       item.status = receipt.status === 1 ? "confirmed" : "reverted";
+      item.confirmMs = Date.now() - t0;
+      // Actual cost, for analysis: what the network charged vs what we estimated.
+      try {
+        const gasUsed = BigInt(receipt.gasUsed ?? 0n);
+        const effGasPrice = BigInt(receipt.gasPrice ?? gasPriceWei ?? 0n);
+        item.gasUsed = gasUsed.toString();
+        item.gasPriceUsed = effGasPrice.toString();
+        item.gasCostWei = (gasUsed * effGasPrice).toString();
+      } catch {
+        /* gas accounting degrades gracefully */
+      }
       results.push(item);
-      log(`  ${item.id}: SENT ${tx.hash} (${item.status})`);
+      log(
+        `  ${item.id}: SENT ${tx.hash} (${item.status}) ` +
+          `gasUsed=${item.gasUsed ?? "?"} confirmMs=${item.confirmMs}`
+      );
     } catch (err) {
       item.error = shortReason(err);
       item.profitable = item.profitable ?? false;

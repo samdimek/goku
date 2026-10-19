@@ -21,6 +21,11 @@ module.exports = {
       url: process.env.SEPOLIA_RPC_URL || "https://ethereum-sepolia-rpc.publicnode.com",
       accounts,
       chainId: 11155111,
+      // Best-effort floor. hardhat-ethers may still derive EIP-1559 fees from
+      // the network when broadcasting (observed on Sepolia), so callers must
+      // also tolerate underpriced-replacement errors — scanner/run.js' sendWait
+      // does exactly that. 2 gwei on testnet is cheap insurance either way.
+      gasPrice: 2_000_000_000,
     },
     // Mainnet: go-live config. Same code, only the addresses provider changes.
     mainnet: {

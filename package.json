@@ -9,7 +9,9 @@
     "scan": "hardhat run scanner/index.js",
     "scan:sepolia": "hardhat run scanner/index.js --network sepolia",
     "ledger": "hardhat run scanner/ledger.js",
-    "ledger:sepolia": "hardhat run scanner/ledger.js --network sepolia"
+    "ledger:sepolia": "hardhat run scanner/ledger.js --network sepolia",
+    "e2e": "hardhat run scanner/run.js",
+    "e2e:sepolia": "hardhat run scanner/run.js --network sepolia"
   },
   "dependencies": {
     "@aave/core-v3": "^1.16.2-beta.1",

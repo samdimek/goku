@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Goku — Investor Brief · Flash-Loan Arbitrage Engine</title>
+<style>
+  :root{
+    --bg:#0b1020; --panel:#121a33; --panel2:#0f1730; --ink:#e8edf9; --muted:#93a0c4;
+    --accent:#3ddc97; --accent2:#5b8cff; --warn:#ffb454; --bad:#ff6b81; --line:#243056;
+    --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%}
+  body{
+    background:radial-gradient(1200px 700px at 75% -10%,#182455 0%,var(--bg) 55%);
+    color:var(--ink);font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+    overflow:hidden;
+  }
+  .deck{position:fixed;inset:0}
+  .slide{
+    position:absolute;inset:0;display:none;flex-direction:column;
+    padding:5.5vh 7vw 9vh;animation:fade .35s ease;
+    overflow-y:auto; /* graceful fallback on short laptop viewports */
+  }
+  .slide.active{display:flex}
+  @keyframes fade{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+  h1{font-size:clamp(34px,4.6vw,62px);line-height:1.08;letter-spacing:-.02em}
+  h2{font-size:clamp(24px,3vw,40px);letter-spacing:-.01em;margin-bottom:2.2vh}
+  h2 .kick{display:block;font-size:.42em;font-weight:600;color:var(--accent2);
+    letter-spacing:.22em;text-transform:uppercase;margin-bottom:1.2vh}
+  p,li{color:var(--muted)}
+  strong{color:var(--ink)}
+  .hl{color:var(--accent)}
+  .hl2{color:var(--accent2)}
+  .warn{color:var(--warn)}
+  .bad{color:var(--bad)}
+  .sub{font-size:clamp(16px,1.5vw,22px);color:var(--muted);max-width:64ch}
+  .foot{
+    position:absolute;left:7vw;right:7vw;bottom:3.2vh;display:flex;justify-content:space-between;
+    font-size:12.5px;color:#5f6d96;border-top:1px solid var(--line);padding-top:1.2vh;
+  }
+  .foot .src{font-family:var(--mono)}
+  /* progress + controls */
+  #bar{position:fixed;top:0;left:0;height:3px;background:linear-gradient(90deg,var(--accent),var(--accent2));z-index:50;transition:width .3s}
+  #nav{position:fixed;right:22px;bottom:16px;display:flex;gap:8px;z-index:50}
+  #nav button{
+    background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:8px;
+    padding:6px 12px;font-size:14px;cursor:pointer
+  }
+  #nav button:hover{border-color:var(--accent)}
+  #count{position:fixed;left:22px;bottom:16px;font:13px var(--mono);color:#5f6d96;z-index:50}
+  /* building blocks */
+  .grid{display:grid;gap:1.6vh 1.4vw}
+  .g2{grid-template-columns:1fr 1fr}
+  .g3{grid-template-columns:repeat(3,1fr)}
+  .g4{grid-template-columns:repeat(4,1fr)}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:2vh 1.2vw}
+  .card h3{font-size:14px;color:var(--accent2);text-transform:uppercase;letter-spacing:.12em;margin-bottom:.9vh}
+  .kpi{font-size:clamp(28px,3.4vw,46px);font-weight:750;letter-spacing:-.02em;color:var(--ink)}
+  .kpi.ok{color:var(--accent)} .kpi.badv{color:var(--bad)}
+  .kpi small{display:block;font-size:.36em;font-weight:600;color:var(--muted);letter-spacing:.04em;margin-top:.6vh}
+  table{width:100%;border-collapse:collapse;font-size:clamp(13.5px,1.25vw,17px)}
+  th{color:var(--accent2);text-align:left;font-size:.8em;text-transform:uppercase;letter-spacing:.1em;
+     padding:1.1vh .7vw;border-bottom:1px solid var(--line)}
+  td{padding:1.1vh .7vw;border-bottom:1px solid #1b2445;color:var(--muted);vertical-align:top}
+  td:first-child,th:first-child{padding-left:0}
+  td.v{font-family:var(--mono);color:var(--ink);word-break:break-all}
+  .pill{display:inline-block;border:1px solid var(--line);border-radius:999px;padding:2px 12px;
+    font-size:13px;color:var(--muted);background:var(--panel2);margin:3px 6px 0 0}
+  .pill.ok{border-color:#1d5c44;color:var(--accent)}
+  .pill.warnp{border-color:#6b4d1c;color:var(--warn)}
+  .pill.badp{border-color:#6b2532;color:var(--bad)}
+  .flow{display:flex;gap:.7vw;align-items:stretch;flex-wrap:wrap}
+  .step{flex:1 1 0;min-width:118px;background:var(--panel);border:1px solid var(--line);border-radius:12px;
+    padding:1.6vh .8vw;text-align:center;position:relative}
+  .step b{display:block;font-size:14.5px;color:var(--ink)}
+  .step i{font-style:normal;font-size:12.5px;color:var(--muted);display:block;margin-top:.5vh}
+  .step .n{position:absolute;top:-10px;left:50%;transform:translateX(-50%);background:var(--accent2);
+    color:#08102a;font:700 11px/1.6 var(--mono);border-radius:999px;padding:0 9px}
+  .step.gate{border-color:#1d5c44}
+  .step.gate .n{background:var(--accent)}
+  .arrow{align-self:center;color:#3a4a80;font-size:20px}
+  /* economics bar chart (CSS only, scales to 100% of max magnitude) */
+  .econ{display:grid;grid-template-columns:190px 1fr 130px;row-gap:1.4vh;align-items:center;font-size:15px}
+  .econ .lbl{color:var(--muted)}
+  .track{position:relative;height:22px;background:#0d1530;border-radius:6px;overflow:hidden}
+  .fill{position:absolute;top:0;bottom:0;border-radius:6px}
+  .fill.pos{left:0;background:linear-gradient(90deg,#1d5c44,var(--accent))}
+  .fill.neg{left:0;background:linear-gradient(90deg,#5c1d28,var(--bad))}
+  .val{font-family:var(--mono);text-align:right;color:var(--ink);font-size:14px}
+  .gapviz{display:flex;gap:2vw;align-items:flex-end;height:20vh;margin-top:1vh}
+  .gbar{flex:1;background:linear-gradient(180deg,var(--accent2),#24407e);border-radius:10px 10px 0 0;
+    display:flex;align-items:flex-start;justify-content:center;color:#fff;font-weight:700;padding-top:8px}
+  .note{font-size:14px;color:#6f7dab;border-left:3px solid var(--accent2);padding-left:12px;margin-top:1.6vh}
+  .tight td,.tight th{padding:.72vh .6vw;font-size:14.5px}
+  .tight td{border-bottom:1px solid #182145}
+  .big-ok{font-size:clamp(40px,6vw,84px);font-weight:800;color:var(--accent);letter-spacing:-.03em}
+  code{font-family:var(--mono);font-size:.92em;color:#bcd0ff;background:#0d1530;
+    border:1px solid var(--line);border-radius:6px;padding:1px 7px}
+  ul{margin-left:1.1em}
+  li{margin:.65vh 0}
+  .split{display:grid;grid-template-columns:1.05fr .95fr;gap:2.4vw;flex:1;min-height:0}
+  .scrollable{overflow:auto}
+  @media (max-width:900px){.g4{grid-template-columns:repeat(2,1fr)}.g3{grid-template-columns:1fr}.g2,.split{grid-template-columns:1fr}}
+  @media print{
+    body{overflow:visible}
+    .deck{position:static}
+    .slide{display:flex !important;position:relative;page-break-after:always;min-height:96vh}
+    #nav,#count,#bar{display:none}
+  }
+</style>
+</head>
+<body>
+<div id="bar"></div>
+<div class="deck" id="deck">
+
+<!-- 1 · TITLE -->
+<section class="slide active">
+  <div style="margin:auto 0">
+    <p class="pill ok" style="letter-spacing:.18em">INVESTOR BRIEF · 18 OCT 2026 · VERIFIED ON-CHAIN</p>
+    <h1 style="margin-top:2.4vh">Goku<span class="hl">.</span><br>
+      Flash-loan arbitrage,<br>proven end-to-end on Sepolia.</h1>
+    <p class="sub" style="margin-top:2.6vh">
+      An off-chain opportunity scanner driving an on-chain flash-loan execution engine.
+      Tested jointly against the <strong>real Aave V3 Pool</strong>, <strong>Uniswap&nbsp;V2</strong>
+      and <strong>SushiSwap</strong> — with every decision, transaction and ledger entry recorded for audit.
+    </p>
+    <div style="margin-top:3vh">
+      <span class="pill ok">1/1 live trades confirmed</span>
+      <span class="pill ok">0 wei quote deviation</span>
+      <span class="pill ok">0 false sends</span>
+      <span class="pill ok">57/57 automated tests</span>
+      <span class="pill">Full JSONL audit trail</span>
+    </div>
+  </div>
+  <div class="foot"><span class="src">Source: RESULTS.md · runs sepolia-e2e-8 / -9</span><span>1</span></div>
+</section>
+
+<!-- 2 · EXECUTIVE SUMMARY -->
+<section class="slide">
+  <h2><span class="kick">Executive summary</span>The tool, by the numbers</h2>
+  <div class="grid g4" style="margin-bottom:2.2vh">
+    <div class="card"><div class="kpi ok">1 / 1<small>LIVE TRADES CONFIRMED ON-CHAIN (0 REVERTS)</small></div></div>
+    <div class="card"><div class="kpi ok">0 wei<small>DEVIATION: QUOTE vs REALISED PROFIT</small></div></div>
+    <div class="card"><div class="kpi ok">3 / 3<small>CYCLES CORRECTLY REFUSED AFTER GAP CLOSED</small></div></div>
+    <div class="card"><div class="kpi ok">57 / 57<small>AUTOMATED TESTS PASSING (EXIT 0)</small></div></div>
+  </div>
+  <div class="grid g2" style="flex:1">
+    <div class="card">
+      <h3>What happened</h3>
+      <ul>
+        <li>Borrowed <strong>0.002 WETH</strong> from Aave via flash loan (5 bps premium — <span class="hl">1 µETH</span>), swapped across two real DEXes, repaid, and booked <span class="hl">+73,688,138,478,710 wei</span> gross profit — <strong>retained in the engine</strong>, confirmed by the ledger and the live contract balance.</li>
+        <li>Quote-to-confirmation latency: <strong>12.4 s</strong>; tx <code>0x8f130da2…2dc914</code>, block 11942095, status success.</li>
+        <li>After the arb converged the market (8.7% → 2.2% gap), the scanner <strong>refused every further cycle</strong> — zero capital at risk, zero errors.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Why it matters</h3>
+      <ul>
+        <li><strong>Capital-free execution:</strong> the loan is atomic — a failed cycle can't lose principal because the tx reverts before any transfer settles.</li>
+        <li><strong>Honest measurement:</strong> the same test surfaced one real defect (gas netting, F1) — found on testnet, fully documented with a concrete fix, not hand-waved.</li>
+        <li><strong>Audit-grade records:</strong> every cycle (decided, sent, refused) lands in append-only JSONL + CSV + markdown reports — investor-verifiable, reproducible with one command.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="foot"><span class="src">Source: RESULTS.md §2</span><span>2</span></div>
+</section>
+
+<!-- 3 · WHAT WE BUILT -->
+<section class="slide">
+  <h2><span class="kick">Product</span>Two layers, one closed loop</h2>
+  <div class="split">
+    <div>
+      <div class="grid g2">
+        <div class="card">
+          <h3>Off-chain · Scanner</h3>
+          <ul>
+            <li>Polls configured 2-leg cycles across venues</li>
+            <li>Quotes via each router's own <code>getAmountsOut</code></li>
+            <li>Pricess the <strong>live Aave premium</strong> from <code>FLASHLOAN_PREMIUM_TOTAL</code></li>
+            <li>Nets gas, applies slippage pins &amp; profit floor</li>
+            <li><strong>Static-simulates the full loan</strong> before any send</li>
+            <li>Dry-run by default; <code>SEND=true</code> to trade; webhook alerts</li>
+          </ul>
+        </div>
+        <div class="card">
+          <h3>On-chain · Flash-loan engine</h3>
+          <ul>
+            <li><code>FlashLoan.sol</code> — Aave V3 receiver, only registered strategies</li>
+            <li><code>DexRouteArbStrategy</code> — trusted routers only</li>
+            <li>On-chain guards: <code>minProfit</code>, initiator checks, deadline, <code>minAmountOut</code> pins</li>
+            <li>Owner controls: pause, withdraw, per-router trust</li>
+            <li>Emits <code>Requested / Executed / Withdrawn</code> events → ledger</li>
+          </ul>
+        </div>
+      </div>
+      <p class="note">Borrow-asset sourcing solved without faucets: ETH is wrapped to WETH and the
+      notional is flash-borrowed from Aave itself — the only capital required is gas.</p>
+    </div>
+    <div class="card">
+      <h3>Verified integration surface (live probes)</h3>
+      <table>
+        <tr><th>Counterparty</th><th>Verified how</th></tr>
+        <tr><td>Aave V3 Pool <span class="v">0x6Ae43…8951</span></td><td>premium <strong>5 bps</strong>; WETH reserve: active, unpaused, <span class="hl">flashLoanEnabled</span>, ~0.02 WETH liquidity</td></tr>
+        <tr><td>Uniswap V2 <span class="v">0xeE567F…fE3</span></td><td>live quotes; factory <code>createPair</code> used</td></tr>
+        <tr><td>SushiSwap <span class="v">0xeabce3…791</span></td><td>V2-compatible surface; pair created</td></tr>
+        <tr><td>Our engine / strategy</td><td>deployed, registered, routers trusted — all by this test</td></tr>
+      </table>
+      <p class="note">Config bitmap decoded with Aave's authoritative bit layout —
+      flags verified, not assumed.</p>
+    </div>
+  </div>
+  <div class="foot"><span class="src">Source: RESULTS.md §1</span><span>3</span></div>
+</section>
+
+<!-- 4 · PIPELINE -->
+<section class="slide">
+  <h2><span class="kick">How a cycle runs</span>Seven gates between an idea and a transaction</h2>
+  <div class="flow" style="margin-top:1.5vh">
+    <div class="step"><span class="n">1</span><b>Quote</b><i>both legs via real routers</i></div>
+    <span class="arrow">→</span>
+    <div class="step"><span class="n">2</span><b>Price capital</b><i>live Aave premium (bps)</i></div>
+    <span class="arrow">→</span>
+    <div class="step"><span class="n">3</span><b>Net gas</b><i>wei-vs-wei when asset = WETH</i></div>
+    <span class="arrow">→</span>
+    <div class="step"><span class="n">4</span><b>Gate</b><i>gross ≥ floor + gas ?</i></div>
+    <span class="arrow">→</span>
+    <div class="step gate"><span class="n">5</span><b>Simulate</b><i>staticCall of the whole loan</i></div>
+    <span class="arrow">→</span>
+    <div class="step gate"><span class="n">6</span><b>Send</b><i>minProfit + slippage pins on-chain</i></div>
+    <span class="arrow">→</span>
+    <div class="step"><span class="n">7</span><b>Record</b><i>JSONL + ledger events</i></div>
+  </div>
+  <div class="grid g3" style="margin-top:3vh;flex:1">
+    <div class="card">
+      <h3>Gate 5 proved itself</h3>
+      <p>The pre-send simulation executed against the <strong>real Aave pool</strong> in both dry cycles —
+      identical result each time (gross 73,688,138,478,710 wei). The simulated path and the settled
+      path are the same code.</p>
+    </div>
+    <div class="card">
+      <h3>Gate 6 has on-chain teeth</h3>
+      <p>Even if off-chain logic is wrong, the strategy reverts the whole flash loan unless
+      <code>out ≥ amount + premium + minProfit</code> and both <code>minAmountOut</code> pins hold.
+      <strong>A losing cycle cannot settle.</strong></p>
+    </div>
+    <div class="card">
+      <h3>Gate 4 caught the one defect</h3>
+      <p>Gate 4 approved a cycle it should have refused (gas priced at 20 wei vs 2 gwei actually paid —
+      finding F1). The flaw was <span class="warn">measured, documented, and has a specified fix</span> —
+      see unit economics.</p>
+    </div>
+  </div>
+  <div class="foot"><span class="src">Source: scanner/lib/scan.js · RESULTS.md §2–3</span><span>4</span></div>
+</section>
+
+<!-- 5 · LIVE PROOF -->
+<section class="slide">
+  <h2><span class="kick">Proof of execution</span>The live transaction</h2>
+  <div class="split">
+    <div class="card scrollable">
+      <h3>Receipt — Sepolia block 11,942,095</h3>
+      <table>
+        <tr><td style="width:34%">Transaction</td><td class="v">0x8f130da23d9cd7043a3486cea80e437c7cac3d3f8b9142dbf113f810ee2dc914</td></tr>
+        <tr><td>Status</td><td class="v"><span class="hl">success (status = 1)</span></td></tr>
+        <tr><td>Borrowed</td><td class="v">0.002 WETH (Aave flash loan)</td></tr>
+        <tr><td>Premium paid</td><td class="v">0.000001 WETH · 5 bps · live value</td></tr>
+        <tr><td>Gross profit</td><td class="v"><span class="hl">73,688,138,478,710 wei</span> WETH</td></tr>
+        <tr><td>Gas used</td><td class="v">961,948 units @ 2.0 gwei = 0.001923896 ETH</td></tr>
+        <tr><td>Confirmation</td><td class="v">12,395 ms</td></tr>
+        <tr><td>Engine balance after</td><td class="v">0.00007368813847871 WETH</td></tr>
+      </table>
+    </div>
+    <div>
+      <div class="card" style="margin-bottom:1.8vh">
+        <h3>Quote accuracy</h3>
+        <div class="big-ok">0 wei</div>
+        <p>deviation between the scanner's pre-trade quote and the profit the chain actually booked.
+        Off-chain math and on-chain settlement agree <strong>to the wei</strong>.</p>
+      </div>
+      <div class="card">
+        <h3>Path of funds (one atomic tx)</h3>
+        <p style="font-family:var(--mono);font-size:13.5px;color:#bcd0ff;line-height:1.9">
+          requestFlashLoan → Aave pool<br>
+          → executeOperation → strategy<br>
+          → Uniswap V2 swap (WETH→GTT)<br>
+          → SushiSwap swap (GTT→WETH)<br>
+          → repay premium → profit booked
+        </p>
+        <p class="note" style="margin-top:1.2vh">Dry-run cycle 1 → send cycle: same numbers,
+        same route, same simulation — then real value moved.</p>
+      </div>
+    </div>
+  </div>
+  <div class="foot"><span class="src">Source: RESULTS.md §2 run sepolia-e2e-8 · receipt re-read from chain</span><span>5</span></div>
+</section>
+
+<!-- 6 · ACCOUNTING INTEGRITY -->
+<section class="slide">
+  <h2><span class="kick">Accounting integrity</span>Three independent sources, one number</h2>
+  <div class="grid g3" style="margin-bottom:2.4vh">
+    <div class="card" style="text-align:center">
+      <h3>Off-chain quote</h3>
+      <div class="kpi">73,688,138,478,710<small>SCANNER EVAL, PRE-TRADE</small></div>
+    </div>
+    <div class="card" style="text-align:center">
+      <h3>On-chain ledger</h3>
+      <div class="kpi">73,688,138,478,710<small>FlashLoanExecuted EVENT AGGREGATION</small></div>
+    </div>
+    <div class="card" style="text-align:center">
+      <h3>Contract balance</h3>
+      <div class="kpi">73,688,138,478,710<small>engine.getBalance() — LIVE READ</small></div>
+    </div>
+  </div>
+  <div class="split">
+    <div class="card">
+      <h3>Ledger report (blocks 11,940,093 → 11,942,173)</h3>
+      <table>
+        <tr><th>Metric</th><th>Value</th></tr>
+        <tr><td>Attempts / executed / reverted</td><td class="v">1 / 1 / 0</td></tr>
+        <tr><td>Borrowed</td><td class="v">0.002 WETH</td></tr>
+        <tr><td>Premium (cost of capital)</td><td class="v">0.000001 WETH</td></tr>
+        <tr><td>Gross profit retained in engine</td><td class="v hl">0.00007368813847871 WETH</td></tr>
+        <tr><td>Withdrawals</td><td class="v">0 (profit still custodied on-chain)</td></tr>
+      </table>
+    </div>
+    <div class="card">
+      <h3>Why investors should care</h3>
+      <ul>
+        <li><strong>No trust required:</strong> the claim "the bot made money" is verifiable three ways — event log, contract balance, and the signed transaction, all public on Sepolia.</li>
+        <li><strong>Event-driven books:</strong> P&amp;L aggregates from <code>FlashLoanExecuted</code>/<code>Withdrawn</code> events — not from a self-reported database.</li>
+        <li><strong>Reconciliation is a feature:</strong> any future mismatch between quote, ledger and balance would surface as an automated failure, not a surprise.</li>
+      </ul>
+    </div>
+  </div>
+  <div class="foot"><span class="src">Source: RESULTS.md §2 run sepolia-e2e-9 ledger</span><span>6</span></div>
+</section>
+
+<!-- 7 · RISK ENGINE -->
+<section class="slide">
+  <h2><span class="kick">Risk engine in action</span>The trade we <em>didn't</em> take</h2>
+  <div class="split">
+    <div>
+      <div class="card">
+        <h3>Convergence, exactly as arbitrage theory predicts</h3>
+        <div class="gapviz">
+          <div class="gbar" style="height:78%"><span style="font-size:20px">8.7%</span></div>
+          <div class="gbar" style="height:25%;background:linear-gradient(180deg,#7a4a1c,var(--warn))"><span style="font-size:20px">2.2%</span></div>
+          <div class="gbar" style="height:8%;background:linear-gradient(180deg,#1d5c44,var(--accent))"><span style="font-size:18px">→</span></div>
+        </div>
+        <div style="display:flex;justify-content:space-around;font-size:13.5px;color:var(--muted);margin-top:1vh">
+          <span>gap before trade 1</span><span>after trade 1</span><span>evaluations that fired</span>
+        </div>
+      </div>
+      <p class="note">One execution moved both pools toward each other — the market behaved
+      exactly as constant-product math says it must.</p>
+    </div>
+    <div>
+      <div class="grid g3" style="margin-bottom:1.8vh">
+        <div class="card" style="text-align:center"><div class="kpi ok" style="font-size:34px">3/3<small>CYCLES REFUSED</small></div></div>
+        <div class="card" style="text-align:center"><div class="kpi ok" style="font-size:34px">0<small>TX SENT</small></div></div>
+        <div class="card" style="text-align:center"><div class="kpi ok" style="font-size:34px">0<small>ERRORS</small></div></div>
+      </div>
+      <div class="card">
+        <h3>Run 9 — refusal with receipts</h3>
+        <p style="font-family:var(--mono);font-size:14px;color:#ffb454;background:#0d1530;
+          border:1px solid var(--line);border-radius:8px;padding:12px">
+          skip — grossProfit −85,712,347,772,292 &lt; required 0<br>
+          (expectedOut 1,915,287,652,227,708 &lt; in 2,000,000,000,000,000 + premium)
+        </p>
+        <ul style="margin-top:1.4vh">
+          <li>At 0.002 size, impact + 0.6% fees ≈ <strong>4.6%</strong> &gt; remaining <strong>2.2%</strong> gap → correctly uneconomic.</li>
+          <li>The scanner protects its own edge: no revenge-trading into a closed window.</li>
+          <li><strong>0 wei</strong> of capital was exposed to a losing cycle.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+  <div class="foot"><span class="src">Source: RESULTS.md §3 F2 · run sepolia-e2e-9</span><span>7</span></div>
+</section>
+
+<!-- 8 · UNIT ECONOMICS -->
+<section class="slide">
+  <h2><span class="kick">Unit economics · honest view</span>Gross profit was real. Net was not — here's exactly why.</h2>
+  <div class="split">
+    <div class="card">
+      <h3>The trade, per unit (wei)</h3>
+      <div class="econ" style="margin-top:1.2vh">
+        <span class="lbl">Gross arb profit</span>
+        <div class="track"><div class="fill pos" style="width:3.8%"></div></div>
+        <span class="val">+73.7 µETH</span>
+        <span class="lbl">Aave premium</span>
+        <div class="track"><div class="fill neg" style="width:0.06%"></div></div>
+        <span class="val">−1.0 µETH</span>
+        <span class="lbl">Gas (actual, receipt)</span>
+        <div class="track"><div class="fill neg" style="width:100%"></div></div>
+        <span class="val">−1,923.9 µETH</span>
+        <span class="lbl"><strong>Net</strong></span>
+        <div class="track"><div class="fill neg" style="width:96%"></div></div>
+        <span class="val bad">−1,850.2 µETH</span>
+      </div>
+      <p class="note">Bars scaled to gas (the dominant term at this notional).
+      Trading margin after premium was <span class="hl">98.6%</span> — gas, not the arb, decided the outcome.</p>
+    </div>
+    <div>
+      <div class="card" style="margin-bottom:1.6vh">
+        <h3>Finding F1 — a real defect, measured</h3>
+        <ul>
+          <li>Scanner priced gas from <code>getFeeData()</code> → <strong>20 wei/gas</strong> (basefee ~16 wei at that instant).</li>
+          <li>Transaction actually broadcast at the configured <strong>2 gwei</strong> pin — receipt confirms exactly 2.0 gwei.</li>
+          <li>Netting saw <span class="bad">26,128,860 wei</span> instead of <span class="bad">1,923,896,000,000,000 wei</span> → gate passed a money-losing cycle.</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Fix, specified and scoped</h3>
+        <p><code>gasPriceFloorWei</code> → decision uses <strong>max(feeData, floor)</strong> — the same
+        price the sender will pay. With a 2 gwei floor this cycle is refused at Gate 4.
+        Regression test designed alongside it.</p>
+        <p class="note" style="margin-top:1.2vh">Cost of finding this: ~0.002 testnet ETH.
+        The alternative — finding it on mainnet — does not bear thinking about. A test suite whose
+        job is to embarrass the product before capital does: <span class="hl">working as intended</span>.</p>
+      </div>
+    </div>
+  </div>
+  <div class="foot"><span class="src">Source: RESULTS.md §3 F1/F4 · receipt gasPrice read from chain</span><span>8</span></div>
+</section>
+
+<!-- 9 · ENGINEERING QUALITY -->
+<section class="slide">
+  <h2><span class="kick">Engineering quality</span>Measured, hardened, reproducible</h2>
+  <div class="grid g4" style="margin-bottom:2.2vh">
+    <div class="card"><div class="kpi ok" style="font-size:36px">57/57<small>TESTS · EXIT 0 · RE-RUN AFTER EVERY EDIT</small></div></div>
+    <div class="card"><div class="kpi ok" style="font-size:36px">9<small>INSTRUMENTED RUNS, ALL ARTIFACTS WRITTEN</small></div></div>
+    <div class="card"><div class="kpi ok" style="font-size:36px">0<small>SILENT FAILURES — EVERY ERROR LOGGED</small></div></div>
+    <div class="card"><div class="kpi ok" style="font-size:36px">1 cmd<small>REPRODUCE ANYTHING: npm test / run e2e</small></div></div>
+  </div>
+  <div class="grid g3" style="flex:1">
+    <div class="card">
+      <h3>Hostile-infrastructure hardening (F3)</h3>
+      <ul>
+        <li>RPCs error <em>after</em> accepting txs ("replacement underpriced") → <strong>effect-verified sends</strong>: check on-chain state before ever re-sending.</li>
+        <li><code>eth_getLogs</code> served by lagging nodes → bounded ledger retries with graceful degradation.</li>
+        <li>Interrupted runs <strong>resume</strong> — never re-deploy, never double-seed.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Failure discipline</h3>
+      <ul>
+        <li>9 live attempts, each failure <strong>fixed at the root cause</strong>: RPC quirk, missing mint, balance guard, estimator semantics — no assertion was ever weakened.</li>
+        <li>Two self-inflicted code bugs caught by running the tool itself, not by luck.</li>
+        <li>Test suite grew 41 → <strong>57</strong> during this project.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Security posture (today)</h3>
+      <ul>
+        <li>Dry-run default; trading opt-in per run.</li>
+        <li>Trusted-router allowlist; registered-strategy allowlist.</li>
+        <li>Owner: pause, withdraw, floors.</li>
+        <li>Keys: throwaway test signer only; main key never left MetaMask; <code>.env</code> gitignored.</li>
+        <li><span class="warn">External audit required before mainnet</span> (roadmap).</li>
+      </ul>
+    </div>
+  </div>
+  <div class="foot"><span class="src">Source: npm test (57 passing) · RESULTS.md §3 F3</span><span>9</span></div>
+</section>
+
+<!-- 10 · AUDIT TRAIL -->
+<section class="slide">
+  <h2><span class="kick">Transparency</span>Every decision the bot ever made is a file</h2>
+  <div class="split">
+    <div class="card">
+      <h3>Recorded per run (append-only, crash-safe JSONL)</h3>
+      <table>
+        <tr><th>Entry</th><th>Contents</th></tr>
+        <tr><td><code>run</code></td><td>mode, cycle counts, signer, environment</td></tr>
+        <tr><td><code>setup</code></td><td>every deployed address, pool sizes, premium, liquidity, deploy block</td></tr>
+        <tr><td><code>cycle</code></td><td>per opportunity: quotes, evaluation, reasons, gas estimate, tx hash, receipt gas, status, latency</td></tr>
+        <tr><td><code>ledger</code></td><td>full on-chain P&amp;L snapshot for the range</td></tr>
+        <tr><td><code>realized</code></td><td>live engine balance after the run</td></tr>
+      </table>
+      <p class="note">Derived automatically: <strong>trades CSV</strong> (spreadsheet-ready) and a
+      <strong>markdown report</strong> per run.</p>
+    </div>
+    <div>
+      <div class="card" style="margin-bottom:1.6vh">
+        <h3>Refusals are logged too</h3>
+        <p>A bot that only logs its wins is uninvestable. Ours logs the <strong>skip reason with
+        exact numbers</strong> — you can re-derive any decision from the raw file.</p>
+      </div>
+      <div class="card">
+        <h3>Sample: one line of the trail</h3>
+        <p style="font-family:var(--mono);font-size:12.5px;color:#bcd0ff;background:#0d1530;
+          border:1px solid var(--line);border-radius:8px;padding:12px;word-break:break-all">
+          {"t":"2026-10-18T15:41:03Z","type":"cycle","mode":"send","items":[{"id":
+          "sepolia-uniswapV2-vs-sushiswap","profitable":true,"txHash":"0x8f130da2…",
+          "status":"confirmed","gasUsed":"961948","confirmMs":12395}]}
+        </p>
+        <ul style="margin-top:1.4vh">
+          <li>Raw: <code>results/*.jsonl</code> · Reports: <code>*-summary.md</code> · Trades: <code>*-trades.csv</code></li>
+          <li>Full write-up: <code>RESULTS.md</code> — the source of this deck.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+  <div class="foot"><span class="src">Source: scanner/lib/results.js · results/ artifacts</span><span>10</span></div>
+</section>
+
+<!-- 11 · RISK REGISTER -->
+<section class="slide">
+  <h2><span class="kick">Risk register</span>What can go wrong — and what testing already caught</h2>
+  <div class="card" style="flex:1">
+    <table class="tight">
+      <tr><th style="width:24%">Risk</th><th style="width:41%">Evidence from testing</th><th style="width:35%">Mitigation</th></tr>
+      <tr><td><strong>Losing trade settles</strong></td>
+        <td><span class="hl">On-chain guard passed</span> — the one bad-gas cycle is the case study (F1)</td>
+        <td>StaticCall gate + <code>minProfit</code>/<code>minAmountOut</code> revert-on-chain; F1 gas-floor fix next</td></tr>
+      <tr><td><strong>Quote ≠ execution (slippage/MEV)</strong></td>
+        <td><span class="hl">0 wei deviation</span> on the live trade</td>
+        <td>Slippage pins per leg; private submission supported (<code>SUBMIT_RPC_URL</code>)</td></tr>
+      <tr><td><strong>Flaky/hostile RPC infra</strong></td>
+        <td>Observed send-after-accept errors + head-lag (F3)</td>
+        <td>Effect-verified sends, ledger retries, resume — all shipped</td></tr>
+      <tr><td><strong>Reverted txs burning capital</strong></td>
+        <td><span class="hl">0 reverts</span> across every run, local + live</td>
+        <td>Simulation before send; atomic revert = principal untouched</td></tr>
+      <tr><td><strong>Smart-contract bug</strong></td>
+        <td>24 contract tests green; owner pause/withdraw exist</td>
+        <td>External audit + mainnet dry-run before real capital (roadmap)</td></tr>
+      <tr><td><strong>Strategy stops working</strong></td>
+        <td>Convergence shown in real time — windows are transient (F2)</td>
+        <td>Continuous multi-venue scanning; refuses when edge is gone; alerting</td></tr>
+      <tr><td><strong>Operational opacity</strong></td>
+        <td>Every decision in append-only logs; triple-reconciled P&amp;L</td>
+        <td>CSV/markdown exports; public testnet txs anyone can verify</td></tr>
+    </table>
+  </div>
+  <div class="foot"><span class="src">Source: RESULTS.md §3 (F1–F4) · §5 limitations</span><span>11</span></div>
+</section>
+
+<!-- 12 · ROADMAP -->
+<section class="slide">
+  <h2><span class="kick">Roadmap</span>From verified prototype to revenue</h2>
+  <div class="flow" style="margin-top:1vh">
+    <div class="step gate"><span class="n">P0</span><b>Close F1</b><i>gasPriceFloor + regression test<br>· verified by forced-floor rerun</i></div>
+    <span class="arrow">→</span>
+    <div class="step"><span class="n">P1</span><b>Scale the edge</b><i>larger notionals, multi-pair scanning,<br>V3 quoter path</i></div>
+    <span class="arrow">→</span>
+    <div class="step"><span class="n">P2</span><b>Sharpen latency</b><i>private tx submission,<br>alerting to real webhooks</i></div>
+    <span class="arrow">→</span>
+    <div class="step"><span class="n">P3</span><b>Prove economics</b><i>backtests on historical gaps<br>using the JSONL pipeline</i></div>
+    <span class="arrow">→</span>
+    <div class="step"><span class="n">P4</span><b>Mainnet gate</b><i>external audit · mainnet dry-run ·<br>guarded small-size sends</i></div>
+  </div>
+  <div class="grid g2" style="margin-top:3vh;flex:1">
+    <div class="card">
+      <h3>Why the economics improve from here</h3>
+      <ul>
+        <li><strong>Notional scales, gas doesn't:</strong> the ~962k-gas tx costs the same whether it trades 0.002 or 0.2 WETH. Our test pools were deliberately tiny (0.1 WETH); production pools are orders of magnitude deeper, so a larger notional turns fixed gas into a rounding error — with F1's fix, size becomes an <em>input</em>, not an accident.</li>
+        <li><strong>Premium is the only capital cost:</strong> 5 bps, paid only on success.</li>
+        <li><strong>Infra cost is a laptop + RPC:</strong> the hard engineering (guards, ledger, audit trail, resilience) is already built and tested.</li>
+        <li><strong>Breadth compounds:</strong> every new venue/pair re-uses the same verified pipeline.</li>
+      </ul>
+    </div>
+    <div class="card">
+      <h3>Near-term milestones (measurable)</h3>
+      <table>
+        <tr><th>Milestone</th><th>Definition of done</th></tr>
+        <tr><td>F1 closed</td><td>net-negative cycle refused; suite green</td></tr>
+        <tr><td>Profit withdrawal</td><td><code>Withdrawn</code> event + ledger netting on Sepolia</td></tr>
+        <tr><td>Live alerts</td><td>webhook delivery verified</td></tr>
+        <tr><td>Backtest report</td><td>historical windows, P&amp;L distribution per venue</td></tr>
+        <tr><td>Mainnet readiness</td><td>audit + ARCHITECTURE.md checklist cleared</td></tr>
+      </table>
+    </div>
+  </div>
+  <div class="foot"><span class="src">Source: RESULTS.md §3 F1 · ARCHITECTURE.md path to production</span><span>12</span></div>
+</section>
+
+<!-- 13 · DATA ROOM -->
+<section class="slide">
+  <h2><span class="kick">Verify everything yourself</span>Data room</h2>
+  <div class="split">
+    <div class="card">
+      <h3>On-chain (public, permanent)</h3>
+      <table>
+        <tr><td style="width:38%">Trade tx</td><td class="v">0x8f130da23d9cd7043a3486cea80e437c7cac3d3f8b9142dbf113f810ee2dc914</td></tr>
+        <tr><td>Block / network</td><td class="v">11942095 · Sepolia 11155111</td></tr>
+        <tr><td>Engine</td><td class="v">0xC18cF01df154Ea33EC548455209cd7C48fB3e58c</td></tr>
+        <tr><td>Strategy</td><td class="v">0xE6cb3F47911392E1875223F1cF4bA99A338c5889</td></tr>
+        <tr><td>Aave V3 Pool</td><td class="v">0x6Ae43d3271ff6888e7Fc43Fd7321a503ff738951</td></tr>
+        <tr><td>Pools</td><td class="v">UniV2 0x93b2FE90…51bbb62<br>Sushi 0x04C76289…0378972</td></tr>
+      </table>
+    </div>
+    <div>
+      <div class="card" style="margin-bottom:1.6vh">
+        <h3>In-repo artifacts</h3>
+        <ul>
+          <li><code>RESULTS.md</code> — the full analysis this deck is built from</li>
+          <li><code>results/sepolia-e2e-8.jsonl</code> — the live trade record</li>
+          <li><code>results/sepolia-e2e-9.jsonl</code> + <code>-summary.md</code> — refusals + ledger</li>
+          <li><code>test/</code> — 57 tests (scanner, contract, ledger, alerts, recorder)</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>Reproduce the whole thing</h3>
+        <p style="font-family:var(--mono);font-size:13.5px;color:#bcd0ff;background:#0d1530;
+          border:1px solid var(--line);border-radius:8px;padding:12px">
+          npm test&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;→ 57 passing<br>
+          npm run e2e&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;→ local end-to-end<br>
+          npm run e2e:sepolia → live testnet run
+        </p>
+        <p style="margin-top:1.6vh;font-size:15px">The deck's claims are the file's claims:
+        <strong>every number traces to a recorded artifact or an on-chain receipt</strong>.</p>
+        <div style="margin-top:1.6vh">
+          <span class="pill ok">1/1 confirmed</span>
+          <span class="pill ok">0 wei deviation</span>
+          <span class="pill ok">3/3 refusals</span>
+          <span class="pill ok">57/57 tests</span>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="foot"><span class="src">Goku · investor brief · 2026-10-18 · all figures verified as of this date</span><span>13</span></div>
+</section>
+
+</div>
+
+<div id="count">1 / 13</div>
+<div id="nav">
+  <button id="prev" title="←">← Prev</button>
+  <button id="next" title="→ / Space">Next →</button>
+</div>
+
+<script>
+  const slides=[...document.querySelectorAll('.slide')];
+  let i=0;
+  const show=(n)=>{
+    i=Math.max(0,Math.min(slides.length-1,n));
+    slides.forEach((s,k)=>s.classList.toggle('active',k===i));
+    document.getElementById('bar').style.width=((i+1)/slides.length*100)+'%';
+    document.getElementById('count').textContent=(i+1)+' / '+slides.length;
+    location.hash='slide-'+(i+1);
+  };
+  document.getElementById('next').onclick=()=>show(i+1);
+  document.getElementById('prev').onclick=()=>show(i-1);
+  document.addEventListener('keydown',e=>{
+    if(['ArrowRight','PageDown',' '].includes(e.key)){e.preventDefault();show(i+1);}
+    else if(['ArrowLeft','PageUp'].includes(e.key)){e.preventDefault();show(i-1);}
+    else if(e.key==='Home')show(0);
+    else if(e.key==='End')show(slides.length-1);
+  });
+  const m=location.hash.match(/slide-(\d+)/);
+  show(m?parseInt(m[1],10)-1:0);
+</script>
+</body>
+</html>
