@@ -9,8 +9,19 @@
   "routeStrategyAddress": "0x0000000000000000000000000000000000000000",
   "wrappedNativeAsset": "0x0000000000000000000000000000000000000000",
   "_gasAccounting": "Set wrappedNativeAsset (e.g. WETH) so gas cost, quoted in wei, is netted out of the profit decision. Leave zero address to ignore gas off-chain (the engine's on-chain minProfit guard still applies).",
+  "gasPriceFloorWei": "0",
+  "_gasPriceFloor": "F1 fix: the gate prices gas at max(getFeeData(), floor). Set the floor to >= the gasPrice your sender actually pays (e.g. 2000000000 = 2 gwei) so the decision can never underprice gas and approve a net-negative trade. Env GAS_PRICE_FLOOR_WEI overrides.",
+  "netProfitOnChain": true,
+  "_netProfitOnChain": "When the borrowed asset wraps native ETH, the minProfit passed on-chain includes the gas budget: a trade that cannot cover its own gas reverts (Unprofitable) instead of landing net-negative. Set false to enforce only the gross floor on-chain.",
   "submitRpcUrl": "",
-  "_submitRpc": "Optional private/mempool-hiding RPC used ONLY for sending (e.g. https://protect.flashbots.net). Quotes still come from the main RPC.",
+  "_submitRpc": "Optional private/mempool-hiding RPC used ONLY for sending (with PRIVATE_KEY in .env; quotes still come from the main RPC). Flashbots Protect: Sepolia https://rpc-sepolia.flashbots.net/ , mainnet https://rpc.flashbots.net/fast — it accepts eth_sendRawTransaction, hides the tx from the public mempool, and does NOT include reverting transactions by default, so a failed trade costs no gas. Env SUBMIT_RPC_URL overrides.",
+  "tenderly": {
+    "accessToken": "",
+    "accountSlug": "",
+    "projectSlug": "",
+    "strict": true,
+    "_comment": "Optional fail-closed preflight: every send is dry-run against Tenderly's simulate API first; a revert there blocks the broadcast (no gas paid). strict=true also blocks on API/infra errors; set false to only block on definitive reverts. Prefer env TENDERLY_ACCESS_TOKEN / TENDERLY_ACCOUNT_SLUG / TENDERLY_PROJECT_SLUG. Requires a Tenderly paid plan."
+  },
   "legSlippageBps": {},
   "alerts": {
     "webhookUrl": "",

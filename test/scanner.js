@@ -274,4 +274,348 @@ describe("scanner end-to-end (local mock market)", function () {
     expect(results[0].error).to.match(/must end in borrowAsset|not closed/);
     expect(results[0].profitable).to.equal(false);
   });
+
+  // --- profit-safety: never broadcast a trade that would lose money -----
+
+  it("F1 regression: prices gas at max(feeData, gasPriceFloorWei) and refuses net-negative trades", async function () {
+    const { config, engineAddress, strategyAddress, provider, signer, assetAddr } =
+      await loadFixture(marketFixture);
+
+    // 1,000,000 gwei floor: gasUnits (~400k) x floor = ~400 ETH, far above
+    // the 11.5 ETH gross profit of this mock trade -> the gate must refuse,
+    // and nothing may be broadcast. (Per-test config copy: loadFixture
+    // returns one shared object across tests.)
+    const cfg = { ...config, gasPriceFloorWei: (10n ** 15n).toString() };
+
+    const results = await scanOnce({
+      provider, signer, engineAddress, strategyAddress, config: cfg, send: true, log: () => {},
+    });
+
+    expect(results[0].profitable).to.equal(false);
+    expect(results[0].txHash).to.equal(undefined);
+    expect(results[0].reasons.join(" ")).to.match(/grossProfit/);
+    // the decision priced gas at the floor, not at whatever feeData claimed
+    expect(BigInt(results[0].gasPriceWei)).to.equal(10n ** 15n);
+
+    const engine = await ethers.getContractAt("FlashLoan", engineAddress);
+    expect(await engine.getBalance(assetAddr)).to.equal(0); // nothing executed
+  });
+
+  it("net-profit guard: the on-chain minProfit includes the gas budget", async function () {
+    const { config, engineAddress, strategyAddress, provider, signer } =
+      await loadFixture(marketFixture);
+
+    // 1 gwei: keeps the trade profitable, but gas > 0 for sure
+    const cfg = { ...config, gasPriceFloorWei: "1000000000" };
+    const results = await scanOnce({
+      provider, signer, engineAddress, strategyAddress, config: cfg, send: true, log: () => {},
+    });
+
+    const r = results[0];
+    expect(r.profitable).to.equal(true);
+    expect(r.status).to.equal("confirmed");
+    expect(BigInt(r.eval.gasCostWei)).to.be.greaterThan(0n);
+    // minProfit floor + gas budget: the ENGINE would revert a trade that
+    // cannot cover its own gas, even if the off-chain gate were bypassed.
+    expect(BigInt(r.onChainMinProfit)).to.equal(
+      BigInt(r.eval.minProfit) + BigInt(r.eval.gasCostWei)
+    );
+  });
+
+  it("net-profit guard can be disabled (on-chain minProfit stays at the floor)", async function () {
+    const { config, engineAddress, strategyAddress, provider, signer } =
+      await loadFixture(marketFixture);
+
+    const cfg = { ...config, gasPriceFloorWei: "1000000000", netProfitOnChain: false };
+    const results = await scanOnce({
+      provider, signer, engineAddress, strategyAddress, config: cfg, send: true, log: () => {},
+    });
+
+    expect(results[0].profitable).to.equal(true);
+    expect(BigInt(results[0].eval.gasCostWei)).to.be.greaterThan(0n); // gas was priced...
+    expect(BigInt(results[0].onChainMinProfit)).to.equal(
+      BigInt(results[0].eval.minProfit)
+    ); // ...but not enforced on-chain
+  });
+
+  it("Tenderly preflight: a simulated revert blocks the send (fail-closed)", async function () {
+    const { config, engineAddress, strategyAddress, provider, signer, assetAddr } =
+      await loadFixture(marketFixture);
+
+    const cfg = {
+      ...config,
+      tenderly: { accessToken: "t", accountSlug: "acc", projectSlug: "proj" },
+    };
+    let calls = 0;
+    const fetchStub = async () => {
+      calls += 1;
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          simulation: { status: false, error: "execution reverted: Unprofitable" },
+        }),
+      };
+    };
+
+    const results = await scanOnce({
+      provider, signer, engineAddress, strategyAddress, config: cfg, send: true, log: () => {},
+      deps: { fetch: fetchStub },
+    });
+
+    expect(calls).to.equal(1); // the gate ran
+    expect(results[0].profitable).to.equal(false);
+    expect(results[0].blockedBy).to.equal("tenderly");
+    expect(results[0].txHash).to.equal(undefined);
+    expect(results[0].tenderly.ok).to.equal(false);
+    expect(results[0].tenderly.reason).to.match(/Unprofitable/);
+
+    const engine = await ethers.getContractAt("FlashLoan", engineAddress);
+    expect(await engine.getBalance(assetAddr)).to.equal(0); // nothing executed
+  });
+
+  it("Tenderly preflight: a passing simulation lets the send proceed", async function () {
+    const { config, engineAddress, strategyAddress, provider, signer, assetAddr } =
+      await loadFixture(marketFixture);
+
+    const cfg = {
+      ...config,
+      tenderly: { accessToken: "t", accountSlug: "acc", projectSlug: "proj" },
+    };
+    let req = null;
+    const fetchStub = async (url, init) => {
+      req = { url, init };
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ simulation: { status: true, gas_used: 350000 } }),
+      };
+    };
+
+    const results = await scanOnce({
+      provider, signer, engineAddress, strategyAddress, config: cfg, send: true, log: () => {},
+      deps: { fetch: fetchStub },
+    });
+
+    expect(results[0].status).to.equal("confirmed");
+    expect(results[0].tenderly.ok).to.equal(true);
+    expect(results[0].tenderly.gasUsed).to.equal("350000");
+
+    // the request was the real dry-run call: right endpoint, auth header,
+    // never persisted, calldata = requestFlashLoan(engine, strategy, ...)
+    expect(req.url).to.equal(
+      "https://api.tenderly.co/api/v1/account/acc/project/proj/simulate"
+    );
+    const body = JSON.parse(req.init.body);
+    expect(body.save).to.equal(false);
+    expect(body.save_if_fails).to.equal(false);
+    expect(body.from).to.equal(await signer.getAddress());
+    expect(body.to).to.equal(engineAddress);
+    const selector = ethers
+      .id("requestFlashLoan(address,uint256,address,uint256,bytes)")
+      .slice(0, 10);
+    expect(body.input.slice(0, 10)).to.equal(selector);
+
+    const engine = await ethers.getContractAt("FlashLoan", engineAddress);
+    expect(await engine.getBalance(assetAddr)).to.equal(E("11.5"));
+  });
+
+  it("Tenderly preflight: strict blocks on API errors, non-strict degrades to the eth_call gate", async function () {
+    const { config, engineAddress, strategyAddress, provider, signer } =
+      await loadFixture(marketFixture);
+
+    const strictCfg = {
+      ...config,
+      tenderly: { accessToken: "t", accountSlug: "acc", projectSlug: "proj" },
+      // strict defaults to true
+    };
+    const httpErr = async () => ({ ok: false, status: 500, json: async () => ({}) });
+
+    const blocked = await scanOnce({
+      provider, signer, engineAddress, strategyAddress, config: strictCfg, send: true, log: () => {},
+      deps: { fetch: httpErr },
+    });
+    expect(blocked[0].profitable).to.equal(false);
+    expect(blocked[0].txHash).to.equal(undefined);
+    expect(blocked[0].tenderly.reason).to.equal("http-500");
+
+    const looseCfg = {
+      ...config,
+      tenderly: { accessToken: "t", accountSlug: "acc", projectSlug: "proj", strict: false },
+    };
+    const degraded = await scanOnce({
+      provider, signer, engineAddress, strategyAddress, config: looseCfg, send: true, log: () => {},
+      deps: { fetch: httpErr },
+    });
+    expect(degraded[0].status).to.equal("confirmed"); // eth_call gate already ran
+    expect(degraded[0].tenderly.ok).to.equal(true);
+  });
+
+  it("no Tenderly config: the gate is skipped and fetch is never called", async function () {
+    const { config, engineAddress, strategyAddress, provider, signer } =
+      await loadFixture(marketFixture);
+
+    const fetchStub = async () => {
+      throw new Error("must not be called");
+    };
+    const results = await scanOnce({
+      provider, signer, engineAddress, strategyAddress, config, send: true, log: () => {},
+      deps: { fetch: fetchStub },
+    });
+
+    expect(results[0].status).to.equal("confirmed");
+    expect(results[0].tenderly).to.equal(undefined);
+  });
+});
+
+describe("scanner safety helpers", function () {
+  it("getGasPriceWei: the floor dominates when the chain price is lower (F1)", async function () {
+    const { getGasPriceWei } = require("../scanner/lib/scan");
+    const floor = 10n ** 15n; // 1000 gwei, far above any local feeData
+    expect(await getGasPriceWei(ethers.provider, { floorWei: floor })).to.equal(floor);
+    // no floor -> plain feeData (pre-F1 behavior preserved)
+    const plain = await getGasPriceWei(ethers.provider);
+    expect(typeof plain).to.equal("bigint");
+    expect(plain).to.be.at.least(0n);
+  });
+
+  it("getGasPriceWei: a provider that cannot report falls back to the floor, not to 0", async function () {
+    const { getGasPriceWei } = require("../scanner/lib/scan");
+    const floor = 123456789n;
+    expect(await getGasPriceWei({}, { floorWei: floor })).to.equal(floor);
+    expect(await getGasPriceWei({})).to.equal(0n);
+  });
+
+  it("parseWei rejects malformed wei values loudly (a typo must not disable protection)", function () {
+    const { parseWei } = require("../scanner/lib/scan");
+    expect(() => parseWei("abc", "gasPriceFloorWei")).to.throw(/gasPriceFloorWei/);
+    expect(parseWei("1000", "x")).to.equal(1000n);
+  });
+
+  it("resolveSendSigner: public by default; private wallet on a submit RPC when keyed", function () {
+    const { resolveSendSigner } = require("../scanner/lib/submit");
+    const sentinel = { address: "0x0000000000000000000000000000000000000001" };
+
+    const pub = resolveSendSigner({ signer: sentinel, submitRpcUrl: "", privateKey: "" });
+    expect(pub.signer).to.equal(sentinel);
+    expect(pub.mode).to.equal("public");
+
+    // submit URL without a key: keep the signer and report the downgrade
+    const down = resolveSendSigner({
+      signer: sentinel,
+      submitRpcUrl: "https://rpc.example",
+      privateKey: "",
+    });
+    expect(down.signer).to.equal(sentinel);
+    expect(down.note).to.equal("no-key");
+
+    const pk = ethers.Wallet.createRandom().privateKey;
+    const submitUrl = "https://rpc-sepolia.flashbots.net/";
+    const priv = resolveSendSigner({
+      signer: sentinel,
+      submitRpcUrl: submitUrl,
+      privateKey: pk,
+      log: () => {},
+    });
+    expect(priv.mode).to.equal("private");
+    expect(priv.signer).to.not.equal(sentinel);
+    expect(priv.signer.address).to.equal(new ethers.Wallet(pk).address);
+    expect(priv.signer.provider._getConnection().url).to.equal(submitUrl);
+  });
+});
+
+describe("restore solver (pure gap restoration)", function () {
+  const { amountOutFor, solveSwapForTargetRatio, planRestore } = require("../scanner/lib/restore");
+
+  it("amountOutFor prices a V2 swap with the LP fee", function () {
+    // 1000 in, balanced 1M/1M pool, 30 bps fee -> out ~996.006
+    const out = amountOutFor(E(1000), E(1000000), E(1000000), 30);
+    expect(out).to.be.greaterThan(E("995.9"));
+    expect(out).to.be.lessThan(E("996.1"));
+    expect(amountOutFor(0n, E(1), E(1), 30)).to.equal(0n);
+  });
+
+  it("plans a mid->asset swap (SLL mid into the pool) to RAISE a converged pool to its target", function () {
+    // target 1000 mid per asset; pool converged at ~959.2 mid per asset.
+    // Selling mid grows the pool's mid reserve -> price rMid/rAsset rises.
+    const reserveAsset = E("0.1");
+    const reserveMid = E("95.92");
+    const plan = planRestore({
+      reserveAsset,
+      reserveMid,
+      targetMidPerAsset: 1000,
+      feeBps: 30,
+      toleranceBps: 50n,
+    });
+    expect(plan, "plan").to.not.equal(null);
+    expect(plan.direction).to.equal("mid->asset");
+    expect(plan.reachable).to.equal(true);
+    expect(plan.amountIn).to.be.greaterThan(0n);
+    // executing the planned swap must land the pool at ~1000 mid/asset
+    const out = amountOutFor(plan.amountIn, reserveMid, reserveAsset, 30);
+    const priceAfter = Number(reserveMid + plan.amountIn) / Number(reserveAsset - out);
+    expect(priceAfter).to.be.closeTo(1000, 0.5); // within 0.05%
+    expect(plan.priceAfter).to.be.closeTo(priceAfter, 0.000001);
+  });
+
+  it("plans an asset->mid swap (BUY mid from the pool) to LOWER a pool priced ABOVE its target", function () {
+    // target 920, converged at ~959.2 -> price too high -> buy mid with asset;
+    // the pool's asset reserve grows -> price rMid/rAsset falls.
+    const reserveAsset = E("0.1");
+    const reserveMid = E("95.92");
+    const plan = planRestore({
+      reserveAsset,
+      reserveMid,
+      targetMidPerAsset: 920,
+      feeBps: 30,
+      toleranceBps: 50n,
+    });
+    expect(plan, "plan").to.not.equal(null);
+    expect(plan.direction).to.equal("asset->mid");
+    const out = amountOutFor(plan.amountIn, reserveAsset, reserveMid, 30);
+    const priceAfter = Number(reserveMid - out) / Number(reserveAsset + plan.amountIn);
+    expect(priceAfter).to.be.closeTo(920, 0.5);
+  });
+
+  it("skips a venue whose price is already within tolerance", function () {
+    expect(
+      planRestore({
+        reserveAsset: E("0.1"),
+        reserveMid: E("100"),
+        targetMidPerAsset: 1000,
+        toleranceBps: 50n,
+      })
+    ).to.equal(null);
+  });
+
+  it("caps the swap and flags unreachable when the target exceeds the budget", function () {
+    // price 100 -> target 10000 requires selling far more mid than 50% of
+    // the pool's mid reserve (the natural scale for a mid->asset push).
+    const plan = planRestore({
+      reserveAsset: E("1"),
+      reserveMid: E("100"),
+      targetMidPerAsset: 10000,
+      feeBps: 30,
+      toleranceBps: 50n,
+      maxInBps: 5000n,
+    });
+    expect(plan, "plan").to.not.equal(null);
+    expect(plan.direction).to.equal("mid->asset");
+    expect(plan.reachable).to.equal(false);
+    expect(plan.amountIn).to.equal(E("50")); // exactly the 50% budget
+  });
+
+  it("solveSwapForTargetRatio returns null when the pool already meets the target", function () {
+    // ratio reserveOut'/reserveIn' only DECREASES while spending reserveIn;
+    // at 0.5 it is already below the 1.0 target -> nothing to solve.
+    expect(
+      solveSwapForTargetRatio({
+        reserveIn: E("2000"),
+        reserveOut: E("1000"),
+        targetNum: 1000n,
+        targetDen: 1000n,
+        feeBps: 30,
+      })
+    ).to.equal(null);
+  });
 });

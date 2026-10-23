@@ -2,25 +2,40 @@
 
 const { ethers } = require("ethers");
 const { ROUTER_ABI, ENGINE_ABI, POOL_ABI } = require("./abi");
+const { resolveTenderlyConfig, tenderlySimulate } = require("./tenderly");
 const core = require("./core");
 
-/** Gas price portably: works on JsonRpcProvider and Hardhat's provider wrapper. */
-async function getGasPriceWei(provider) {
+/**
+ * Gas price for the profitability decision: max(what the chain reports,
+ * the configured floor). The floor is the F1 fix — the decision must never
+ * price gas below what the sender actually pays (a pinned gasPrice, or the
+ * effective gas price of the transaction), or a net-negative trade passes
+ * the gate. Set `gasPriceFloorWei` in config or GAS_PRICE_FLOOR_WEI in env.
+ */
+async function getGasPriceWei(provider, { floorWei = 0n } = {}) {
+  let price = 0n;
   try {
     if (typeof provider.getFeeData === "function") {
       const fd = await provider.getFeeData();
-      return BigInt(fd.gasPrice ?? fd.maxFeePerGas ?? 0n);
-    }
-    if (typeof provider.getGasPrice === "function") {
-      return BigInt(await provider.getGasPrice());
-    }
-    if (typeof provider.send === "function") {
-      return BigInt(await provider.send("eth_gasPrice", []));
+      price = BigInt(fd.gasPrice ?? fd.maxFeePerGas ?? 0n);
+    } else if (typeof provider.getGasPrice === "function") {
+      price = BigInt(await provider.getGasPrice());
+    } else if (typeof provider.send === "function") {
+      price = BigInt(await provider.send("eth_gasPrice", []));
     }
   } catch {
-    /* fall through: gas accounting degrades gracefully to 0 */
+    /* fall through: report 0, then let the floor decide */
   }
-  return 0n;
+  return price > floorWei ? price : floorWei;
+}
+
+/** Parse a config/env wei amount strictly; a typo must never silently disable protection. */
+function parseWei(value, name) {
+  try {
+    return BigInt(value);
+  } catch {
+    throw new Error(`${name} must be an integer wei string, got: ${JSON.stringify(value)}`);
+  }
 }
 
 /** Query the pool's real premium (bps); fall back to Aave's 5 bps default. */
@@ -59,8 +74,19 @@ async function quoteRoute(provider, opp, amountIn) {
  *   -> send (if send=true) or dry-run report.
  *
  * Never throws for a single bad opportunity: errors are reported per item.
+ *
+ * Before sending, three gates must all pass:
+ *   1. worth-it gate (off-chain):  gross >= minProfit + gas at the price the
+ *      sender will actually pay (max(feeData, gasPriceFloorWei))
+ *   2. eth_call preflight:          engine.requestFlashLoan.staticCall with
+ *      the exact send arguments (incl. the gas-inclusive on-chain minProfit)
+ *   3. optional Tenderly dry-run:   same tx simulated off-chain again; if it
+ *      reverts there, nothing is broadcast (configure `tenderly` block)
+ * And sends can go through a private submission RPC (SUBMIT_RPC_URL /
+ * config.submitRpcUrl -> resolve the signer in lib/submit), whose default
+ * policy excludes reverting transactions, so a failed trade costs no gas.
  */
-async function scanOnce({ provider, signer, engineAddress, strategyAddress, config, send = false, log = console.log }) {
+async function scanOnce({ provider, signer, engineAddress, strategyAddress, config, send = false, log = console.log, deps = {} }) {
   const engine = new ethers.Contract(engineAddress, ENGINE_ABI, signer ?? provider);
 
   const defaultAmountIn = BigInt(config.defaultAmountIn ?? "0");
@@ -68,10 +94,26 @@ async function scanOnce({ provider, signer, engineAddress, strategyAddress, conf
   const defaultMinProfit = BigInt(config.defaultMinProfitWei ?? "0");
   const deadlineSecs = Number(config.deadlineSecs ?? 120);
   const wrappedNative = (config.wrappedNativeAsset ?? ethers.ZeroAddress).toLowerCase();
+  // F1 fix: never price gas below what the sender actually pays.
+  // (An empty env var counts as unset — a bare `VAR=` in .env must not
+  // silently disable the floor.)
+  const envFloor = process.env.GAS_PRICE_FLOOR_WEI;
+  const gasFloorWei = parseWei(
+    (envFloor !== undefined && envFloor !== "" ? envFloor : config.gasPriceFloorWei) ?? "0",
+    "gasPriceFloorWei"
+  );
+  // On-chain net guard: fold the gas budget into the minProfit the engine
+  // enforces, so a trade that cannot cover its own gas reverts on-chain.
+  const netProfitOnChain = config.netProfitOnChain !== false;
 
   const premiumBps = await fetchPremiumBps(engine, provider);
-  const feeDataGasPrice = await getGasPriceWei(provider);
-  const gasPriceWei = feeDataGasPrice;
+  const gasPriceWei = await getGasPriceWei(provider, { floorWei: gasFloorWei });
+
+  // Tenderly gate runs only when configured (lazy: no extra RPC round-trip).
+  const tenderlyCfg = resolveTenderlyConfig(config);
+  let chainId = null;
+  const getChainId = async () =>
+    (chainId ??= (await provider.getNetwork()).chainId);
 
   const strategyOk = await engine.isStrategy(strategyAddress).catch(() => false);
   if (!strategyOk) log(`  ! strategy ${strategyAddress} is not registered on engine ${engineAddress}`);
@@ -145,6 +187,7 @@ async function scanOnce({ provider, signer, engineAddress, strategyAddress, conf
       });
       item.eval = evalrSummary(evalr);
       item.gasUnits = gasUnits.toString();
+      item.gasPriceWei = gasPriceWei.toString();
       if (!evalr.profitable) {
         item.profitable = false;
         item.reasons = evalr.reasons;
@@ -153,10 +196,29 @@ async function scanOnce({ provider, signer, engineAddress, strategyAddress, conf
         continue;
       }
 
-      // Authoritative check: simulate the whole flash loan against current state.
-      await engine.requestFlashLoan.staticCall(
-        opp.borrowAsset, amountIn, strategyAddress, evalr.minProfit, strategyParams
-      );
+      // On-chain worth-it guard: the minProfit the ENGINE enforces includes
+      // the gas budget, so if the trade can't cover its own gas the loan
+      // reverts (Unprofitable) instead of landing net-negative.
+      const onChainMinProfit =
+        evalr.minProfit + (netProfitOnChain ? evalr.gasCostWei : 0n);
+      item.onChainMinProfit = onChainMinProfit.toString();
+
+      // Preflight gate 1 (eth_call): simulate the whole flash loan against
+      // current state with the exact arguments we would send. Free, and a
+      // revert here means "do not broadcast".
+      try {
+        await engine.requestFlashLoan.staticCall(
+          opp.borrowAsset, amountIn, strategyAddress, onChainMinProfit, strategyParams
+        );
+        item.preflight = { ethCall: "ok" };
+      } catch (err) {
+        item.preflight = { ethCall: "revert", reason: shortReason(err) };
+        item.error = `preflight eth_call reverted: ${shortReason(err)}`;
+        item.profitable = false;
+        results.push(item);
+        log(`  ${item.id}: skip — ${item.error}`);
+        continue;
+      }
 
       item.profitable = true;
       if (!send) {
@@ -170,9 +232,41 @@ async function scanOnce({ provider, signer, engineAddress, strategyAddress, conf
       }
 
       if (!signer) throw new Error("send=true requires a signer");
+
+      // Preflight gate 2 (optional, Tenderly): dry-run the exact transaction
+      // off-chain once more. A revert here means "do not broadcast" — the
+      // wallet never pays gas for a trade that would fail.
+      if (tenderlyCfg.configured) {
+        const from = await signer.getAddress();
+        const data = engine.interface.encodeFunctionData("requestFlashLoan", [
+          opp.borrowAsset, amountIn, strategyAddress, onChainMinProfit, strategyParams,
+        ]);
+        const sim = await tenderlySimulate({
+          cfg: tenderlyCfg,
+          tx: {
+            networkId: await getChainId(),
+            from,
+            to: engineAddress,
+            data,
+            value: "0",
+            gasLimit: (gasUnits * 12n) / 10n, // 20% headroom over the estimate
+          },
+          fetchImpl: deps.fetch,
+        });
+        item.tenderly = { ok: sim.ok, reason: sim.reason, gasUsed: sim.gasUsed };
+        if (!sim.ok) {
+          item.profitable = false;
+          item.blockedBy = "tenderly";
+          item.reasons = [`tenderly preflight: ${sim.reason}`];
+          results.push(item);
+          log(`  ${item.id}: skip — tenderly preflight: ${sim.reason}`);
+          continue;
+        }
+      }
+
       const t0 = Date.now();
       const tx = await engine.requestFlashLoan(
-        opp.borrowAsset, amountIn, strategyAddress, evalr.minProfit, strategyParams
+        opp.borrowAsset, amountIn, strategyAddress, onChainMinProfit, strategyParams
       );
       item.txHash = tx.hash;
       const receipt = await tx.wait();
@@ -222,4 +316,4 @@ function shortReason(err) {
   return String(msg).split("\n")[0].slice(0, 300);
 }
 
-module.exports = { fetchPremiumBps, quoteLeg, quoteRoute, getGasPriceWei, scanOnce };
+module.exports = { fetchPremiumBps, quoteLeg, quoteRoute, getGasPriceWei, parseWei, scanOnce };

@@ -130,7 +130,7 @@
       <span class="pill ok">1/1 live trades confirmed</span>
       <span class="pill ok">0 wei quote deviation</span>
       <span class="pill ok">0 false sends</span>
-      <span class="pill ok">57/57 automated tests</span>
+      <span class="pill ok">68/68 automated tests</span>
       <span class="pill">Full JSONL audit trail</span>
     </div>
   </div>
@@ -246,10 +246,10 @@
       <strong>A losing cycle cannot settle.</strong></p>
     </div>
     <div class="card">
-      <h3>Gate 4 caught the one defect</h3>
+      <h3>Gate 4 caught the one defect — now fixed</h3>
       <p>Gate 4 approved a cycle it should have refused (gas priced at 20 wei vs 2 gwei actually paid —
-      finding F1). The flaw was <span class="warn">measured, documented, and has a specified fix</span> —
-      see unit economics.</p>
+      finding F1). The flaw was <span class="warn">measured, documented, and fixed within a day</span>
+      (gas-price floor + on-chain net guard + regression tests) — see unit economics.</p>
     </div>
   </div>
   <div class="foot"><span class="src">Source: scanner/lib/scan.js · RESULTS.md §2–3</span><span>4</span></div>
@@ -413,24 +413,27 @@
         </ul>
       </div>
       <div class="card">
-        <h3>Fix, specified and scoped</h3>
+        <h3>Fix — applied 2026-10-19, next day</h3>
         <p><code>gasPriceFloorWei</code> → decision uses <strong>max(feeData, floor)</strong> — the same
-        price the sender will pay. With a 2 gwei floor this cycle is refused at Gate 4.
-        Regression test designed alongside it.</p>
-        <p class="note" style="margin-top:1.2vh">Cost of finding this: ~0.002 testnet ETH.
-        The alternative — finding it on mainnet — does not bear thinking about. A test suite whose
-        job is to embarrass the product before capital does: <span class="hl">working as intended</span>.</p>
+        price the sender will pay — plus an <strong>on-chain net guard</strong>: the enforced
+        <code>minProfit</code> now includes the gas budget, so a trade that can't cover its own gas
+        <em>reverts</em>. With a 2 gwei floor this cycle is refused at Gate 4.</p>
+        <p class="note" style="margin-top:1.2vh">Cost of finding this: ~0.002 testnet ETH. The
+        alternative — finding it on mainnet — does not bear thinking about. Fixed with regression
+        tests (68 passing) and a forced-floor rerun that refuses the same trade, exit 0.
+        A test suite whose job is to embarrass the product before capital does:
+        <span class="hl">working as intended</span>.</p>
       </div>
     </div>
   </div>
-  <div class="foot"><span class="src">Source: RESULTS.md §3 F1/F4 · receipt gasPrice read from chain</span><span>8</span></div>
+  <div class="foot"><span class="src">Source: RESULTS.md §3 F1/F4 + §6 fix log · receipt gasPrice read from chain</span><span>8</span></div>
 </section>
 
 <!-- 9 · ENGINEERING QUALITY -->
 <section class="slide">
   <h2><span class="kick">Engineering quality</span>Measured, hardened, reproducible</h2>
   <div class="grid g4" style="margin-bottom:2.2vh">
-    <div class="card"><div class="kpi ok" style="font-size:36px">57/57<small>TESTS · EXIT 0 · RE-RUN AFTER EVERY EDIT</small></div></div>
+    <div class="card"><div class="kpi ok" style="font-size:36px">68/68<small>TESTS · EXIT 0 · RE-RUN AFTER EVERY EDIT</small></div></div>
     <div class="card"><div class="kpi ok" style="font-size:36px">9<small>INSTRUMENTED RUNS, ALL ARTIFACTS WRITTEN</small></div></div>
     <div class="card"><div class="kpi ok" style="font-size:36px">0<small>SILENT FAILURES — EVERY ERROR LOGGED</small></div></div>
     <div class="card"><div class="kpi ok" style="font-size:36px">1 cmd<small>REPRODUCE ANYTHING: npm test / run e2e</small></div></div>
@@ -463,7 +466,7 @@
       </ul>
     </div>
   </div>
-  <div class="foot"><span class="src">Source: npm test (57 passing) · RESULTS.md §3 F3</span><span>9</span></div>
+  <div class="foot"><span class="src">Source: npm test (68 passing) · RESULTS.md §3 F3</span><span>9</span></div>
 </section>
 
 <!-- 10 · AUDIT TRAIL -->
@@ -515,7 +518,7 @@
       <tr><th style="width:24%">Risk</th><th style="width:41%">Evidence from testing</th><th style="width:35%">Mitigation</th></tr>
       <tr><td><strong>Losing trade settles</strong></td>
         <td><span class="hl">On-chain guard passed</span> — the one bad-gas cycle is the case study (F1)</td>
-        <td>StaticCall gate + <code>minProfit</code>/<code>minAmountOut</code> revert-on-chain; F1 gas-floor fix next</td></tr>
+        <td>StaticCall + optional Tenderly preflight before broadcast; <code>minProfit</code> (now gas-inclusive) / <code>minAmountOut</code> revert-on-chain; private submission (Flashbots Protect) excludes reverting txs — F1 fixed 2026-10-19</td></tr>
       <tr><td><strong>Quote ≠ execution (slippage/MEV)</strong></td>
         <td><span class="hl">0 wei deviation</span> on the live trade</td>
         <td>Slippage pins per leg; private submission supported (<code>SUBMIT_RPC_URL</code>)</td></tr>
@@ -543,7 +546,7 @@
 <section class="slide">
   <h2><span class="kick">Roadmap</span>From verified prototype to revenue</h2>
   <div class="flow" style="margin-top:1vh">
-    <div class="step gate"><span class="n">P0</span><b>Close F1</b><i>gasPriceFloor + regression test<br>· verified by forced-floor rerun</i></div>
+    <div class="step gate"><span class="n">P0 ✓</span><b>F1 closed</b><i>gasPriceFloor + on-chain net guard<br>· regression tests + forced-floor rerun</i></div>
     <span class="arrow">→</span>
     <div class="step"><span class="n">P1</span><b>Scale the edge</b><i>larger notionals, multi-pair scanning,<br>V3 quoter path</i></div>
     <span class="arrow">→</span>
@@ -607,7 +610,7 @@
         <h3>Reproduce the whole thing</h3>
         <p style="font-family:var(--mono);font-size:13.5px;color:#bcd0ff;background:#0d1530;
           border:1px solid var(--line);border-radius:8px;padding:12px">
-          npm test&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;→ 57 passing<br>
+          npm test&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;→ 68 passing<br>
           npm run e2e&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;→ local end-to-end<br>
           npm run e2e:sepolia → live testnet run
         </p>
@@ -617,7 +620,7 @@
           <span class="pill ok">1/1 confirmed</span>
           <span class="pill ok">0 wei deviation</span>
           <span class="pill ok">3/3 refusals</span>
-          <span class="pill ok">57/57 tests</span>
+          <span class="pill ok">68/68 tests</span>
         </div>
       </div>
     </div>

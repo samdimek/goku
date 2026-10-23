@@ -27,6 +27,33 @@
  *   GAS_RESERVE_ETH=0.05   ETH the signer must keep for gas
  *   RUN_ID=<id>      override the run identifier
  *
+ * Profit-safety knobs (see RESULTS.md F1):
+ *   GAS_PRICE_FLOOR_WEI   min gas price the gate may assume; default on
+ *                         Sepolia is 2 gwei — what a tx actually paid in
+ *                         run 8 — so net-negative micro-arbs are skipped.
+ *                         GAS_PRICE_FLOOR_WEI=0 restores the old behavior
+ *                         (only do that to demonstrate a live send).
+ *   SUBMIT_RPC_URL        private submission RPC for sends, e.g.
+ *                         https://rpc-sepolia.flashbots.net/ (Flashbots
+ *                         Protect: hides the tx from the mempool and does
+ *                         not include reverting txs -> no gas on failure).
+ *   TENDERLY_ACCESS_TOKEN / TENDERLY_ACCOUNT_SLUG / TENDERLY_PROJECT_SLUG
+ *                         enable the fail-closed Tenderly preflight before
+ *                         every broadcast (see scanner/lib/tenderly.js).
+ *
+ * Campaign mode (volume runs; every relaxation is recorded in the run log):
+ *   RESTORE_GAP=true      re-create the deliberate price gap on every venue
+ *                         before EACH send cycle (pure constant-product
+ *                         solver in scanner/lib/restore.js) so N trades can
+ *                         fire instead of one. Mock/local markets are
+ *                         static: the restore is recorded as a skip.
+ *   NET_PROFIT_ON_CHAIN=false   keep the on-chain minProfit at the gross
+ *                         floor (no gas budget folded in). The scanner's
+ *                         off-chain gates, the eth_call preflight and the
+ *                         per-leg slippage pins all stay ON.
+ *   ABORT_BELOW_ETH=0.2   stop sending when the signer's ETH balance drops
+ *                         below this reserve (recorded as a `stop` entry).
+ *
  * Resume after an interrupted live run (skip re-deploying what exists):
  *   MID_TOKEN=<addr> ENGINE_ADDRESS=<addr> ROUTE_STRATEGY_ADDRESS=<addr>
  */
@@ -35,6 +62,8 @@ const { ethers } = hre;
 const { scanOnce } = require("./lib/scan");
 const { createRun, writeArtifacts, readEntries } = require("./lib/results");
 const { fetchPnl } = require("./lib/ledger");
+const { resolveSendSigner } = require("./lib/submit");
+const { planRestore } = require("./lib/restore");
 
 // Verified live on Sepolia (2026-10-18): pool holds ~0.02 WETH / ~20k USDC,
 // both reserves flashLoanEnabled=true, premium 5 bps, gas ~0.000000019 gwei.
@@ -71,8 +100,8 @@ const PAIR_RESERVES_ABI = [
 // Seeded venues: MYTOKEN priced at myPerWeth per WETH on each real DEX.
 // The 1000 vs 920 rate is the deliberate ~8.7% price gap the arb trades.
 const VENUES = [
-  { name: "uniswapV2", router: "0xeE567Fe1712Faf6149d80dA1E6934E354124CfE3", factory: "0xF62c03E08ada871A0bEb309762E260a7a6a880E6", myPerWeth: 1000n },
-  { name: "sushiswap", router: "0xeabce3e74ef41fb40024a21cc2ee2f5ddc615791", factory: "0x734583f62bb6ace3c9ba9bd5a53143ca2ce8c55a", myPerWeth: 920n },
+  { name: "uniswapV2", router: "0xeE567Fe1712Faf6149d80dA1E6934E354124CfE3", factory: "0xF62c03E08ada871A0bEb309762E260a7a6a880E6", myPerWeth: 1000n, feeBps: 30 },
+  { name: "sushiswap", router: "0xeabce3e74ef41fb40024a21cc2ee2f5ddc615791", factory: "0x734583f62bb6ace3c9ba9bd5a53143ca2ce8c55a", myPerWeth: 920n, feeBps: 30 },
 ];
 
 const E = (n) => ethers.parseEther(String(n));
@@ -91,21 +120,41 @@ const AMBIGUOUS_SEND =
  * transaction actually did its job on-chain; if so, continue as success.
  * Otherwise retry (nonce is re-fetched fresh on every attempt).
  */
-async function sendWait(label, fn, effect, { attempts = 3, waitMs = 12000, log = () => {} } = {}) {
+async function sendWait(label, fn, effect, { attempts = 3, waitMs = 12000, log = () => {}, onHurdle = null } = {}) {
   for (let attempt = 1; attempt <= attempts; attempt++) {
     try {
       const tx = await fn();
       return await tx.wait();
     } catch (err) {
       const msg = String(err?.shortMessage ?? err?.message ?? err).split("\n")[0];
-      if (!AMBIGUOUS_SEND.test(msg) || attempt === attempts) throw err;
+      if (!AMBIGUOUS_SEND.test(msg) || attempt === attempts) {
+        onHurdle?.({
+          label,
+          error: msg.slice(0, 200),
+          resolution: AMBIGUOUS_SEND.test(msg) ? "exhausted-retries-throws" : "send-failed-throws",
+          attempt,
+        });
+        throw err;
+      }
       log(
         `  [${label}] rpc error '${msg.slice(0, 90)}' — verifying on-chain state ` +
           `(attempt ${attempt}/${attempts})`
       );
+      onHurdle?.({
+        label,
+        error: msg.slice(0, 200),
+        resolution: "ambiguous-rpc-error-verifying-onchain",
+        attempt,
+      });
       await sleep(waitMs);
       if (effect && (await effect())) {
         log(`  [${label}] tx actually landed — continuing`);
+        onHurdle?.({
+          label,
+          error: msg.slice(0, 200),
+          resolution: "verified-onchain-tx-landed",
+          attempt,
+        });
         return null;
       }
     }
@@ -152,6 +201,7 @@ async function deployMockMarket(deployer) {
     venueB,
     amountIn: E(1000),
     poolAddressProvider: await addrProvider.getAddress(),
+    restorable: false, // static mock market: the gap cannot converge
   };
 }
 
@@ -159,7 +209,7 @@ async function deployMockMarket(deployer) {
  * Live Sepolia market: wrap ETH, deploy the engine against the REAL Aave
  * pool, seed MYTOKEN/WETH pools on both real DEXes at different prices.
  */
-async function deploySepoliaMarket(deployer, log) {
+async function deploySepoliaMarket(deployer, log, onHurdle = null) {
   const poolWeth = E(process.env.POOL_WETH_ETH ?? "0.1");
   const tradeWeth = E(process.env.TRADE_WETH_ETH ?? "0.002");
   const wrapAmount = poolWeth * 2n + tradeWeth;
@@ -184,7 +234,7 @@ async function deploySepoliaMarket(deployer, log) {
 
   // All sends below go through sendWait: public Sepolia RPCs may error
   // AFTER accepting a tx, and each step verifies its on-chain effect.
-  const sw = (label, fn, effect) => sendWait(label, fn, effect, { log });
+  const sw = (label, fn, effect) => sendWait(label, fn, effect, { log, onHurdle });
 
   /** Deploy with a nonce-predicted address so an ambiguous error can be
    *  resolved by checking code at that address. */
@@ -340,6 +390,14 @@ async function deploySepoliaMarket(deployer, log) {
     venueB: { name: venues[1].name, router: venues[1].router, pair: venues[1].pair },
     amountIn: tradeWeth,
     poolAddressProvider: providerAddr,
+    restorable: true,
+    venues: venues.map((v) => ({
+      name: v.name,
+      router: v.router,
+      pair: v.pair,
+      myPerWeth: v.myPerWeth,
+      feeBps: v.feeBps,
+    })),
     extraFacts: {
       aavePool: await engine.POOL(),
       aavePremiumBps: premiumBps,
@@ -350,6 +408,210 @@ async function deploySepoliaMarket(deployer, log) {
       signerEthBefore: ethers.formatEther(ethBal),
     },
   };
+}
+
+const PAIR_ABI = [
+  "function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)",
+  "function token0() view returns (address)",
+  "function token1() view returns (address)",
+];
+const ERC20_RW_ABI = [
+  "function balanceOf(address) view returns (uint256)",
+  "function allowance(address,address) view returns (uint256)",
+  "function approve(address,uint256) returns (bool)",
+  "function mint(address,uint256)",
+  "function deposit() payable",
+];
+const MAX_UINT256 = (1n << 256n) - 1n;
+
+/** Read a V2 pair's reserves keyed by which side is MID vs the WETH asset. */
+async function readPairReserves(provider, pairAddr, midAddr, assetAddr) {
+  const pair = new ethers.Contract(pairAddr, PAIR_ABI, provider);
+  const [t0, t1, reserves] = await Promise.all([
+    pair.token0(),
+    pair.token1(),
+    pair.getReserves(),
+  ]);
+  const midIs0 = t0.toLowerCase() === midAddr.toLowerCase();
+  const assetIs0 = t0.toLowerCase() === assetAddr.toLowerCase();
+  if (midIs0 === assetIs0) {
+    throw new Error(`pair ${pairAddr} is not a mid/asset pair (token0=${t0})`);
+  }
+  const t1Expected = midIs0 ? assetAddr : midAddr;
+  if (t1.toLowerCase() !== t1Expected.toLowerCase()) {
+    throw new Error(`pair ${pairAddr} token1 ${t1} != expected ${t1Expected}`);
+  }
+  return {
+    reserveMid: midIs0 ? reserves[0] : reserves[1],
+    reserveAsset: midIs0 ? reserves[1] : reserves[0],
+  };
+}
+
+/** Wallet + engine balances for the holdings record (never throws). */
+async function snapshotHoldings({ provider, signer, engineAddress, asset, mid, phase }) {
+  const out = { phase };
+  try {
+    const erc20 = ["function balanceOf(address) view returns (uint256)"];
+    out.block = await provider.getBlockNumber();
+    out.ethWei = (await provider.getBalance(signer.address)).toString();
+    out.assetWei = (
+      await new ethers.Contract(asset, erc20, provider).balanceOf(signer.address)
+    ).toString();
+    out.midWei = (
+      await new ethers.Contract(mid, erc20, provider).balanceOf(signer.address)
+    ).toString();
+    out.engineProfitWei = (
+      await new ethers.Contract(
+        engineAddress,
+        ["function getBalance(address) view returns (uint256)"],
+        provider
+      ).getBalance(asset)
+    ).toString();
+  } catch (err) {
+    out.error = String(err?.shortMessage ?? err?.message ?? err).split("\n")[0].slice(0, 200);
+  }
+  return out;
+}
+
+/**
+ * Restore the deliberate price gap on every venue (campaign mode): after an
+ * arb trade converged the pools, swap each venue back to its target price
+ * using the pure solver in lib/restore.js. Every restore swap (or skip
+ * reason) is recorded as a `restore` entry; operational problems become
+ * `hurdle` entries and never abort the campaign.
+ */
+async function restoreGap({ deployer, market, log, record, onHurdle }) {
+  if (!market.restorable) {
+    record("restore", {
+      action: "skip",
+      reason: "static mock market — the gap cannot converge; nothing to restore",
+    });
+    return;
+  }
+  const provider = deployer.provider;
+  const deadline = Math.floor(Date.now() / 1000) + 300;
+  const slippageBps = 200n; // solver ran on the same reserves; 2% covers drift
+  const assetRc = new ethers.Contract(market.asset, ERC20_RW_ABI, deployer);
+  const midToken = new ethers.Contract(market.mid, ERC20_RW_ABI, deployer);
+
+  for (const v of market.venues ?? []) {
+    try {
+      const before = await readPairReserves(provider, v.pair, market.mid, market.asset);
+      const plan = planRestore({
+        reserveAsset: before.reserveAsset,
+        reserveMid: before.reserveMid,
+        targetMidPerAsset: v.myPerWeth,
+        feeBps: v.feeBps ?? 30,
+        toleranceBps: 50n,
+      });
+      if (!plan) {
+        record("restore", {
+          venue: v.name,
+          action: "skip",
+          targetMidPerAsset: Number(v.myPerWeth),
+          price: Number(before.reserveMid) / Number(before.reserveAsset),
+          reason: "gap within tolerance",
+        });
+        log(`  restore ${v.name}: gap within tolerance — nothing to do`);
+        continue;
+      }
+      if (!plan.reachable) {
+        record("restore", { venue: v.name, action: "capped", ...plan });
+        log(`  restore ${v.name}: target unreachable within budget — capped best-effort`);
+      }
+
+      // Funding: the spent side must be in the wallet (wrap ETH / mint mid).
+      const spendToken = plan.direction === "asset->mid" ? market.asset : market.mid;
+      const spendRc = spendToken === market.asset ? assetRc : midToken;
+      const held = await spendRc.balanceOf(deployer.address);
+      if (held < plan.amountIn) {
+        const need = plan.amountIn - held;
+        if (plan.direction === "asset->mid") {
+          const gasReserve = E(process.env.GAS_RESERVE_ETH ?? "0.05");
+          const wrap = need + E("0.001"); // small buffer for later cycles
+          const ethBal = await provider.getBalance(deployer.address);
+          if (ethBal < wrap + gasReserve) {
+            throw new Error(
+              `insufficient ETH to wrap for restore (have ${ethers.formatEther(ethBal)}, ` +
+                `need ${ethers.formatEther(wrap + gasReserve)})`
+            );
+          }
+          log(`  restore ${v.name}: wrapping ${ethers.formatEther(wrap)} ETH -> asset`);
+          await sendWait(
+            `restore-wrap-${v.name}`,
+            () => assetRc.deposit({ value: wrap }),
+            async () => (await assetRc.balanceOf(deployer.address)) >= held + wrap,
+            { log, onHurdle }
+          );
+        } else {
+          const minted = need * 2n; // buffer for later cycles
+          log(`  restore ${v.name}: minting ${ethers.formatEther(minted)} mid (open test mint)`);
+          await sendWait(
+            `restore-mint-${v.name}`,
+            () => midToken.mint(deployer.address, minted),
+            async () => (await midToken.balanceOf(deployer.address)) >= plan.amountIn,
+            { log, onHurdle }
+          );
+        }
+      }
+
+      // Approve once per venue+token (max), then the allowance never runs out.
+      const allowance = await spendRc.allowance(deployer.address, v.router);
+      if (allowance < plan.amountIn) {
+        await sendWait(
+          `restore-approve-${v.name}`,
+          () => spendRc.approve(v.router, MAX_UINT256),
+          async () => (await spendRc.allowance(deployer.address, v.router)) >= plan.amountIn,
+          { log, onHurdle }
+        );
+      }
+
+      const router = new ethers.Contract(v.router, V2_ROUTER_ABI, deployer);
+      const minOut = (plan.amountOut * (10000n - slippageBps)) / 10000n;
+      const path =
+        plan.direction === "asset->mid" ? [market.asset, market.mid] : [market.mid, market.asset];
+      const reservesChanged = async () => {
+        const now = await readPairReserves(provider, v.pair, market.mid, market.asset);
+        return now.reserveMid !== before.reserveMid || now.reserveAsset !== before.reserveAsset;
+      };
+      const receipt = await sendWait(
+        `restore-swap-${v.name}`,
+        () =>
+          router.swapExactTokensForTokens(plan.amountIn, minOut, path, deployer.address, deadline),
+        reservesChanged,
+        { log, onHurdle }
+      );
+      const after = await readPairReserves(provider, v.pair, market.mid, market.asset);
+      const priceAfter = Number(after.reserveMid) / Number(after.reserveAsset);
+      record("restore", {
+        venue: v.name,
+        action: "swap",
+        direction: plan.direction,
+        targetMidPerAsset: plan.targetMidPerAsset,
+        priceBefore: plan.priceBefore,
+        priceAfter,
+        amountInWei: plan.amountIn,
+        expectedOutWei: plan.amountOut,
+        reachable: plan.reachable,
+        gasUsedWei: receipt ? receipt.gasUsed?.toString() ?? null : null,
+        gasCostWei:
+          receipt && receipt.gasPrice != null && receipt.gasUsed != null
+            ? (receipt.gasUsed * receipt.gasPrice).toString()
+            : null,
+        txHash: receipt?.hash ?? "landed-verified-by-effect",
+      });
+      log(
+        `  restore ${v.name}: ${plan.direction} ${ethers.formatEther(plan.amountIn)} — ` +
+          `price ${plan.priceBefore.toFixed(1)} -> ${priceAfter.toFixed(1)} ` +
+          `(target ${plan.targetMidPerAsset})`
+      );
+    } catch (err) {
+      const msg = String(err?.shortMessage ?? err?.message ?? err).split("\n")[0].slice(0, 200);
+      record("restore", { venue: v.name, action: "failed", error: msg });
+      onHurdle?.({ stage: `restore-${v.name}`, error: msg, resolution: "restore-failed-continuing" });
+      log(`  restore ${v.name}: FAILED — ${msg} (continuing; the next cycle may refuse)`);
+    }
+  }
 }
 
 async function main() {
@@ -372,6 +634,8 @@ async function main() {
 
   const dryCycles = Number(process.env.DRY_CYCLES ?? 2);
   const sendCycles = Number(process.env.SEND_CYCLES ?? (isSepolia ? 1 : 1));
+  const restoreEnabled = process.env.RESTORE_GAP === "true";
+  const abortBelowWei = ethers.parseEther(process.env.ABORT_BELOW_ETH ?? "0.2");
   const mode = isSepolia ? "SEPOLIA (real Aave pool + real DEX routers)" : "local mock market";
 
   log(`run ${runId} -> ${run.file}`);
@@ -379,12 +643,21 @@ async function main() {
   log(`signer: ${deployer.address}`);
   log(`cycles: ${dryCycles} dry-run, ${sendCycles} send\n`);
 
-  run.record("run", { dryCycles, sendCycles, signer: deployer.address, mode });
+  run.record("run", { dryCycles, sendCycles, signer: deployer.address, mode, restoreEnabled });
+
+  // Every operational obstacle — RPC retries, ambiguous sends, failed
+  // restores, aborted cycles — is recorded and surfaced, never swallowed.
+  const onHurdle = (h) => {
+    run.record("hurdle", h);
+    log(
+      `  ! hurdle [${h.stage ?? h.label ?? "?"}] ${String(h.error ?? "").slice(0, 120)} -> ${h.resolution}`
+    );
+  };
 
   // --- market -------------------------------------------------------------
   log("== setup ==");
   const market = isSepolia
-    ? await deploySepoliaMarket(deployer, log)
+    ? await deploySepoliaMarket(deployer, log, onHurdle)
     : await deployMockMarket(deployer);
 
   const deployBlock = await ethers.provider.getBlockNumber();
@@ -406,12 +679,44 @@ async function main() {
   log("venueA   :", market.venueA);
   log("venueB   :", market.venueB, "\n");
 
+  run.record(
+    "holdings",
+    await snapshotHoldings({
+      provider: ethers.provider,
+      signer: deployer,
+      engineAddress: market.engineAddress,
+      asset: market.asset,
+      mid: market.mid,
+      phase: "baseline",
+    })
+  );
+
+  // Private submission: sends (only) can go through a mempool-hiding RPC
+  // whose default policy excludes reverting transactions.
+  const submission = resolveSendSigner({
+    signer: deployer,
+    submitRpcUrl: process.env.SUBMIT_RPC_URL || "",
+    privateKey: process.env.PRIVATE_KEY || "",
+    log,
+  });
+  run.record("submission", { mode: submission.mode, endpoint: submission.endpoint ?? null });
+  log(`submission: ${submission.mode}${submission.endpoint ? ` via ${submission.endpoint}` : ""}\n`);
+
   // --- scanner config (in-memory; snapshotted into the run dir) -----------
   const config = {
     deadlineSecs: 300,
     defaultSlippageBps: 100,
     defaultMinProfitWei: "0",
     wrappedNativeAsset: market.asset,
+    // F1 fix: price gas at max(feeData, floor). Sepolia's default floor is
+    // 2 gwei — the price the live trade in run 8 actually paid — so the
+    // gate can never approve a money-losing cycle (RESULTS.md F1/F4).
+    gasPriceFloorWei: process.env.GAS_PRICE_FLOOR_WEI || (isSepolia ? "2000000000" : "0"),
+    // Campaign knob (see header): NET_PROFIT_ON_CHAIN=false keeps the
+    // on-chain minProfit at the gross floor — a deliberate, recorded
+    // relaxation for volume runs.
+    netProfitOnChain: process.env.NET_PROFIT_ON_CHAIN !== "false",
+    submitRpcUrl: process.env.SUBMIT_RPC_URL || "",
     opportunities: [
       {
         id: `${network}-${market.venueA.name}-vs-${market.venueB.name}`,
@@ -434,24 +739,100 @@ async function main() {
   // --- scan cycles --------------------------------------------------------
   const scanArgs = {
     provider: ethers.provider,
-    signer: deployer,
+    signer: submission.signer,
     engineAddress: market.engineAddress,
     strategyAddress: market.strategyAddress,
     config,
   };
 
+  const snapshot = (phase) =>
+    snapshotHoldings({
+      provider: ethers.provider,
+      signer: deployer,
+      engineAddress: market.engineAddress,
+      asset: market.asset,
+      mid: market.mid,
+      phase,
+    });
+
   for (let i = 1; i <= dryCycles; i++) {
     log(`== dry-run cycle ${i}/${dryCycles} ==`);
     const t0 = Date.now();
-    const items = await scanOnce({ ...scanArgs, send: false });
-    run.record("cycle", { cycleIndex: i, mode: "dry", durationMs: Date.now() - t0, items });
+    try {
+      const items = await scanOnce({ ...scanArgs, send: false });
+      run.record("cycle", { cycleIndex: i, mode: "dry", durationMs: Date.now() - t0, items });
+    } catch (err) {
+      const msg = String(err?.shortMessage ?? err?.message ?? err).split("\n")[0].slice(0, 300);
+      onHurdle({ stage: `dry-cycle-${i}`, error: msg, resolution: "cycle-aborted-continuing" });
+    }
   }
+
+  let confirmedSends = 0;
+  let stopReason = null;
+
   for (let i = 1; i <= sendCycles; i++) {
+    // Balance guard: never spend the signer past the reserved floor.
+    try {
+      const ethNow = await ethers.provider.getBalance(deployer.address);
+      if (ethNow < abortBelowWei) {
+        stopReason = `eth-below-abort-threshold (${ethers.formatEther(ethNow)} < ${ethers.formatEther(abortBelowWei)} ETH)`;
+        run.record("stop", { reason: stopReason, cycle: i, ethWei: ethNow.toString() });
+        log(`== stop: ${stopReason} ==`);
+        break;
+      }
+    } catch (err) {
+      onHurdle({
+        stage: `balance-check-${i}`,
+        error: String(err?.message ?? err).split("\n")[0].slice(0, 200),
+        resolution: "balance-check-failed-continuing",
+      });
+    }
+
+    run.record("holdings", await snapshot(`pre-send-${i}`));
+
+    // Campaign mode: re-create the price gap before EVERY send cycle so the
+    // scanner finds the opportunity again instead of refusing a converged
+    // market (F2: that refusal is the correct behavior otherwise).
+    if (restoreEnabled) {
+      log(`== gap restore (before send cycle ${i}/${sendCycles}) ==`);
+      try {
+        await restoreGap({ deployer, market, log, record: run.record, onHurdle });
+      } catch (err) {
+        onHurdle({
+          stage: `restore-${i}`,
+          error: String(err?.shortMessage ?? err?.message ?? err).split("\n")[0].slice(0, 200),
+          resolution: "restore-failed-continuing",
+        });
+      }
+    }
+
     log(`== send cycle ${i}/${sendCycles} ==`);
     const t0 = Date.now();
-    const items = await scanOnce({ ...scanArgs, send: true });
-    run.record("cycle", { cycleIndex: i, mode: "send", durationMs: Date.now() - t0, items });
+    try {
+      const items = await scanOnce({ ...scanArgs, send: true });
+      run.record("cycle", { cycleIndex: i, mode: "send", durationMs: Date.now() - t0, items });
+      if (items.some((it) => it.txHash && it.status === "confirmed")) confirmedSends += 1;
+    } catch (err) {
+      const msg = String(err?.shortMessage ?? err?.message ?? err).split("\n")[0].slice(0, 300);
+      run.record("cycle", {
+        cycleIndex: i,
+        mode: "send",
+        durationMs: Date.now() - t0,
+        items: [],
+        aborted: true,
+        error: msg,
+      });
+      onHurdle({ stage: `send-cycle-${i}`, error: msg, resolution: "cycle-aborted-continuing" });
+    }
+
+    run.record("holdings", await snapshot(`post-send-${i}`));
   }
+
+  if (!stopReason) {
+    stopReason = "campaign-complete";
+    run.record("stop", { reason: stopReason, sendCycles, confirmedCycles: confirmedSends });
+  }
+  run.record("holdings", await snapshot("final"));
 
   // --- ledger + report ----------------------------------------------------
   // Public RPCs can serve eth_getLogs from a node whose head lags our own
@@ -472,6 +853,11 @@ async function main() {
     } catch (err) {
       ledgerErr = String(err?.shortMessage ?? err?.message ?? err).split("\n")[0];
       log(`ledger attempt ${attempt}/4 failed: ${ledgerErr}`);
+      onHurdle({
+        stage: `ledger-attempt-${attempt}`,
+        error: ledgerErr,
+        resolution: attempt < 4 ? "retrying-in-10s" : "ledger-unavailable-continuing",
+      });
       if (attempt < 4) {
         log("  waiting 10s for the RPC head to catch up...");
         await new Promise((r) => setTimeout(r, 10000));
@@ -506,6 +892,11 @@ async function main() {
   log(`profitable              : ${summary.profitable}`);
   log(`tx sent                 : ${summary.sent} (confirmed ${summary.confirmed}, reverted ${summary.reverted})`);
   log(`errors                  : ${summary.errors}`);
+  log(`hurdles recorded        : ${summary.hurdles.length}`);
+  log(
+    `gap restores            : ${summary.restores.swaps} swap(s), ${summary.restores.skips} skip(s), ` +
+      `${summary.restores.capped} capped, ${summary.restores.failed} failed`
+  );
   log(`realized profit         : ${summary.grossProfitWei} wei (confirmed trades)`);
   log(`potential profit        : ${summary.potentialProfitWei} wei (dry-run / unconfirmed)`);
   log(`gas spent (actual)      : ${summary.gasSpentWei} wei`);
@@ -514,6 +905,11 @@ async function main() {
     `engine realized balance : ${realized === null ? "n/a (read failed)" : ethers.formatEther(realized)} ` +
       `(${market.asset})`
   );
+  log(
+    `eth spent (start - end) : ${summary.ethSpentWei === null ? "n/a" : ethers.formatEther(summary.ethSpentWei)} ETH`
+  );
+  log(`true net (gross - gas)  : ${summary.netAfterAllGasWei} wei (${ethers.formatEther(summary.netAfterAllGasWei)} asset)`);
+  log(`stop reason             : ${stopReason}`);
   log("");
   log(`jsonl : ${run.file}`);
   log(`csv   : ${csvFile}`);

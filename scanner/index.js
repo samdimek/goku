@@ -4,19 +4,22 @@ const hre = require("hardhat");
 const { scanOnce } = require("./lib/scan");
 const { loadConfig, resolveAddresses } = require("./lib/config");
 const { buildCycleAlert, notify } = require("./lib/alert");
+const { resolveSendSigner } = require("./lib/submit");
 
 function pickSigner(readSigner, config) {
   // send=false stays provider-only; send=true uses the local account, or a
   // dedicated wallet on the private submission RPC when configured
-  // (e.g. SUBMIT_RPC_URL=https://protect.flashbots.net to dodge sandwich bots).
-  const submitUrl = process.env.SUBMIT_RPC_URL || config.submitRpcUrl;
-  if (process.env.SEND === "true" && submitUrl && process.env.PRIVATE_KEY) {
-    return new hre.ethers.Wallet(
-      process.env.PRIVATE_KEY,
-      new hre.ethers.JsonRpcProvider(submitUrl)
-    );
-  }
-  return readSigner;
+  // (e.g. SUBMIT_RPC_URL=https://rpc-sepolia.flashbots.net/ — Flashbots
+  // Protect hides the tx from the mempool and excludes reverting txs by
+  // default, so a would-revert trade never lands and costs no gas).
+  if (process.env.SEND !== "true") return readSigner;
+  const { signer } = resolveSendSigner({
+    signer: readSigner,
+    submitRpcUrl: process.env.SUBMIT_RPC_URL || config.submitRpcUrl,
+    privateKey: process.env.PRIVATE_KEY,
+    log: console.log,
+  });
+  return signer;
 }
 
 async function main() {

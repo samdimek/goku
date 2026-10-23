@@ -26,6 +26,20 @@ function nowIso() {
   }
 }
 
+/** Minimal wei -> ether decimal formatter (keeps this module dependency-free). */
+function fmtEth(wei) {
+  try {
+    const w = BigInt(wei);
+    const neg = w < 0n;
+    const s = (neg ? -w : w).toString().padStart(19, "0");
+    const whole = s.slice(0, -18);
+    const frac = s.slice(-18).replace(/0+$/, "");
+    return `${neg ? "-" : ""}${whole}${frac ? "." + frac : ""}`;
+  } catch {
+    return String(wei);
+  }
+}
+
 /**
  * Create a run log. Each `record(type, data)` appends one JSONL line:
  *   { t: iso-timestamp, runId, network, type, ...data }
@@ -102,6 +116,12 @@ function summarize(entries) {
   const sentTxHashes = [];
   const setup = {};
   let ledger = null;
+  // Campaign artifacts: every obstacle, every gap restore, balance snapshots.
+  const hurdles = [];
+  const restores = { swaps: 0, skips: 0, capped: 0, failed: 0 };
+  let restoreGasWei = 0n;
+  const holdings = [];
+  let stop = null;
 
   for (const e of entries) {
     if (e.type === "setup") {
@@ -115,6 +135,36 @@ function summarize(entries) {
     if (e.type === "ledger-error") {
       // Surface the failure in the report instead of pretending it never ran.
       ledger = { error: e.error, fromBlock: e.fromBlock };
+      continue;
+    }
+    if (e.type === "hurdle") {
+      hurdles.push({
+        stage: e.stage ?? e.label ?? "?",
+        error: e.error ?? "",
+        resolution: e.resolution ?? "",
+      });
+      continue;
+    }
+    if (e.type === "restore") {
+      if (e.action === "swap") restores.swaps += 1;
+      else if (e.action === "failed") restores.failed += 1;
+      else if (e.action === "capped") restores.capped += 1;
+      else restores.skips += 1;
+      if (e.gasCostWei) {
+        try {
+          restoreGasWei += BigInt(e.gasCostWei);
+        } catch {
+          /* skip */
+        }
+      }
+      continue;
+    }
+    if (e.type === "holdings") {
+      holdings.push(e);
+      continue;
+    }
+    if (e.type === "stop") {
+      stop = { reason: e.reason ?? "", ethWei: e.ethWei ?? null, cycle: e.cycle ?? null };
       continue;
     }
     if (e.type !== "cycle") continue;
@@ -161,6 +211,24 @@ function summarize(entries) {
     }
   }
 
+  // True net: confirmed profit minus the gas ACTUALLY paid (trades + restores).
+  const netProfitWei = grossProfitWei - gasSpentWei;
+  const totalGasWei = gasSpentWei + restoreGasWei;
+  const netAfterAllGasWei = grossProfitWei - totalGasWei;
+  // Wallet ETH spent over the run (first snapshot − last snapshot).
+  let ethSpentWei = null;
+  if (holdings.length >= 2) {
+    const first = holdings[0];
+    const last = holdings[holdings.length - 1];
+    if (first.ethWei != null && last.ethWei != null) {
+      try {
+        ethSpentWei = BigInt(first.ethWei) - BigInt(last.ethWei);
+      } catch {
+        ethSpentWei = null;
+      }
+    }
+  }
+
   return {
     cycles,
     opportunitiesEvaluated,
@@ -176,6 +244,15 @@ function summarize(entries) {
     sentTxHashes,
     setup,
     ledger,
+    hurdles,
+    restores,
+    restoreGasWei,
+    holdings,
+    stop,
+    netProfitWei,
+    totalGasWei,
+    netAfterAllGasWei,
+    ethSpentWei,
   };
 }
 
@@ -268,6 +345,63 @@ function summaryMarkdown(run, entries, s) {
     L.push(JSON.stringify(s.ledger, jsonSafe, 2));
     L.push("```");
   }
+  if (s.hurdles.length) {
+    L.push("");
+    L.push("## Hurdles (every obstacle + how it was resolved)");
+    L.push("");
+    L.push("| # | stage / label | error | resolution |");
+    L.push("| --- | --- | --- | --- |");
+    s.hurdles.forEach((h, i) => {
+      const err = String(h.error).replace(/\|/g, "/").slice(0, 140);
+      L.push(`| ${i + 1} | ${h.stage} | ${err} | ${h.resolution} |`);
+    });
+  }
+  if (s.restores.swaps + s.restores.skips + s.restores.failed + s.restores.capped > 0) {
+    L.push("");
+    L.push("## Gap restores (re-creating the price gap between trades)");
+    L.push("");
+    L.push(`- restore swaps executed: ${s.restores.swaps}`);
+    L.push(`- skipped (gap within tolerance / static market): ${s.restores.skips}`);
+    L.push(`- capped (target unreachable within budget): ${s.restores.capped}`);
+    L.push(`- failed: ${s.restores.failed}`);
+    L.push(`- gas spent on restores: ${s.restoreGasWei} wei`);
+  }
+  if (s.holdings.length) {
+    L.push("");
+    L.push("## Holdings (balance snapshots)");
+    L.push("");
+    L.push("| phase | block | ETH | asset | mid | engine profit |");
+    L.push("| --- | --- | --- | --- | --- | --- |");
+    for (const h of s.holdings) {
+      if (h.error) {
+        L.push(
+          `| ${h.phase} | — | — | — | — | snapshot failed: ${String(h.error).replace(/\|/g, "/").slice(0, 60)} |`
+        );
+        continue;
+      }
+      L.push(
+        `| ${h.phase} | ${h.block ?? "?"} | ${fmtEth(h.ethWei)} | ${fmtEth(h.assetWei)} | ${fmtEth(h.midWei)} | ${fmtEth(h.engineProfitWei)} |`
+      );
+    }
+    if (s.ethSpentWei !== null) {
+      L.push("");
+      L.push(`ETH spent over the run (first snapshot − last): **${fmtEth(s.ethSpentWei)}**`);
+    }
+  }
+  L.push("");
+  L.push("## True net (confirmed profit − actual gas paid)");
+  L.push("");
+  L.push(`- gross profit (confirmed trades): ${s.grossProfitWei} wei`);
+  L.push(`- trade gas: ${s.gasSpentWei} wei`);
+  L.push(`- restore gas: ${s.restoreGasWei} wei`);
+  L.push(`- **net after all gas: ${s.netAfterAllGasWei} wei** (${fmtEth(s.netAfterAllGasWei)})`);
+  if (s.stop) {
+    L.push("");
+    L.push("## Stop");
+    L.push("");
+    L.push(`- reason: ${s.stop.reason}`);
+    if (s.stop.ethWei != null) L.push(`- signer ETH at stop: ${fmtEth(s.stop.ethWei)}`);
+  }
   L.push("");
   return L.join("\n");
 }
@@ -294,4 +428,5 @@ module.exports = {
   tradesCsv,
   summaryMarkdown,
   writeArtifacts,
+  fmtEth,
 };
