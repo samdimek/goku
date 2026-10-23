@@ -8,10 +8,13 @@ const { resolveSendSigner } = require("./lib/submit");
 
 function pickSigner(readSigner, config) {
   // send=false stays provider-only; send=true uses the local account, or a
-  // dedicated wallet on the private submission RPC when configured
-  // (e.g. SUBMIT_RPC_URL=https://rpc-sepolia.flashbots.net/ — Flashbots
-  // Protect hides the tx from the mempool and excludes reverting txs by
-  // default, so a would-revert trade never lands and costs no gas).
+  // dedicated wallet on the private submission RPC when configured.
+  // Ethereum L1: e.g. SUBMIT_RPC_URL=https://rpc-sepolia.flashbots.net/
+  // (Flashbots Protect hides the tx from the mempool and excludes reverting
+  // txs by default, so a would-revert trade never lands and costs no gas).
+  // Arbitrum: Flashbots does not support chainId 42161 — use a provider
+  // endpoint with MEV protection (Alchemy/QuickNode) or leave unset (the
+  // sequencer's mempool is already private).
   if (process.env.SEND !== "true") return readSigner;
   const { signer } = resolveSendSigner({
     signer: readSigner,

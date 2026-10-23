@@ -3,7 +3,10 @@ const hre = require("hardhat");
 // Aave V3 PoolAddressesProvider per network.
 // Override with POOL_ADDRESSES_PROVIDER for forks/tests/new markets.
 // Sources: https://aave.com/docs + github.com/aave-dao/aave-address-book
+// All addresses below verified on-chain against the live network RPC
+// (getCode + getPool() + FLASHLOAN_PREMIUM_TOTAL) before being pinned.
 const ADDRESSES_PROVIDER = {
+  arbitrum: "0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb", // Aave V3 Arbitrum One (Pool 0x794a61358D6845594F94dc1DB02A252b5b4814aD, premium 5 bps, WETH TVL ~97.6k)
   sepolia: "0x012bAC54348C0E635dCAc9D5FB99f06F24136C9A", // Aave V3 Sepolia market
   mainnet: "0x2f39d218133AFaB8F2B819B1066c7E434Ad94E9e", // Aave V3 Ethereum mainnet
 };

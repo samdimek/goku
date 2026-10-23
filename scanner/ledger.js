@@ -4,7 +4,7 @@
  * P&L ledger CLI: aggregates FlashLoanRequested / FlashLoanExecuted / Withdrawn
  * events for an engine into a per-asset / per-strategy report.
  *
- * Run:  npx hardhat run scanner/ledger.js --network sepolia
+ * Run:  npm run ledger:arbitrum   (or npx hardhat run scanner/ledger.js --network <net>)
  * Env:  ENGINE_ADDRESS (overrides config), LEDGER_FROM_BLOCK / LEDGER_TO_BLOCK optional,
  *       decimals via scanner config `ledger.decimalsByAsset`.
  */

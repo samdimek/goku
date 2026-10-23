@@ -49,6 +49,28 @@ async function fetchPremiumBps(engine, provider, fallbackBps = 5) {
   }
 }
 
+/**
+ * Flash-loan premium for the configured engine type:
+ *   "aave"    (default) -> read FLASHLOAN_PREMIUM_TOTAL from the pool
+ *   "balancer"          -> 0 bps (Balancer V2's standing fee; override with
+ *                          config.flashLoanFeeBps if governance ever sets one)
+ * A wrong off-chain guess can only make the on-chain guard revert — the
+ * engine prices the loan from the callback's feeAmounts, never from this.
+ */
+async function resolvePremiumBps(config, engine, provider) {
+  const kind = String(config.flashLoanProvider ?? "aave").toLowerCase();
+  if (kind === "aave") return fetchPremiumBps(engine, provider);
+  if (kind === "balancer") {
+    const override = config.flashLoanFeeBps;
+    return override === undefined || override === null || override === ""
+      ? 0n
+      : BigInt(override);
+  }
+  throw new Error(
+    `flashLoanProvider must be "aave" or "balancer", got: ${JSON.stringify(config.flashLoanProvider)}`
+  );
+}
+
 /** Quote one leg through its router's getAmountsOut (view call). */
 async function quoteLeg(provider, router, path, amountIn) {
   const contract = new ethers.Contract(router, ROUTER_ABI, provider);
@@ -106,7 +128,7 @@ async function scanOnce({ provider, signer, engineAddress, strategyAddress, conf
   // enforces, so a trade that cannot cover its own gas reverts on-chain.
   const netProfitOnChain = config.netProfitOnChain !== false;
 
-  const premiumBps = await fetchPremiumBps(engine, provider);
+  const premiumBps = await resolvePremiumBps(config, engine, provider);
   const gasPriceWei = await getGasPriceWei(provider, { floorWei: gasFloorWei });
 
   // Tenderly gate runs only when configured (lazy: no extra RPC round-trip).
@@ -171,6 +193,10 @@ async function scanOnce({ provider, signer, engineAddress, strategyAddress, conf
           opp.borrowAsset, amountIn, strategyAddress, evalr.minProfit, strategyParams
         );
         if (assetIsWrappedNative) {
+          // Correct on both L1 and Arbitrum: on Arbitrum One the node folds
+          // the L1 data fee into eth_estimateGas (as extra L2 gas units),
+          // so gasUnits * gasPrice is already the FULL fee — no separate
+          // L1 line is needed (docs.arbitrum.io gas estimation).
           gasCostWei += gasUnits * BigInt(gasPriceWei.toString());
         }
       } catch (err) {
@@ -316,4 +342,4 @@ function shortReason(err) {
   return String(msg).split("\n")[0].slice(0, 300);
 }
 
-module.exports = { fetchPremiumBps, quoteLeg, quoteRoute, getGasPriceWei, parseWei, scanOnce };
+module.exports = { fetchPremiumBps, resolvePremiumBps, quoteLeg, quoteRoute, getGasPriceWei, parseWei, scanOnce };

@@ -524,6 +524,141 @@ describe("scanner safety helpers", function () {
   });
 });
 
+describe("scanner end-to-end (Balancer engine, 0-bps premium, auto-forward)", function () {
+  async function balancerFixture() {
+    const [deployer, , profitWallet] = await ethers.getSigners();
+
+    const vault = await (await ethers.getContractFactory("MockBalancerVault")).deploy();
+
+    const Token = await ethers.getContractFactory("MockERC20");
+    const asset = await Token.deploy("Mock WETH", "mWETH", 18);
+    const mid = await Token.deploy("Mock MID", "mMID", 18);
+
+    const engine = await (
+      await ethers.getContractFactory("BalancerFlashLoan")
+    ).deploy(await vault.getAddress(), profitWallet.address);
+    const routeStrategy = await (
+      await ethers.getContractFactory("DexRouteArbStrategy")
+    ).deploy(await engine.getAddress());
+    await engine.registerStrategy(await routeStrategy.getAddress(), true);
+
+    const Router = await ethers.getContractFactory("MockRouter");
+    const routerA = await Router.deploy();
+    const routerB = await Router.deploy();
+    await routeStrategy.setTrustedRouter(await routerA.getAddress(), true);
+    await routeStrategy.setTrustedRouter(await routerB.getAddress(), true);
+
+    await asset.mint(await vault.getAddress(), E(1000000)); // lendable liquidity
+    await mid.mint(await routerA.getAddress(), E(1000000));
+    await asset.mint(await routerB.getAddress(), E(1000000));
+    await routerB.setBonusBps(120); // the 1.2% opportunity
+
+    const config = {
+      deadlineSecs: 300,
+      defaultSlippageBps: 50,
+      defaultMinProfitWei: "0",
+      wrappedNativeAsset: await asset.getAddress(),
+      flashLoanProvider: "balancer",
+      opportunities: [
+        {
+          id: "balancer-mWETH-mMID-A-vs-B",
+          borrowAsset: await asset.getAddress(),
+          amountIn: E(1000).toString(),
+          minProfitWei: "0",
+          slippageBps: 50,
+          legs: [
+            { router: await routerA.getAddress(), path: [await asset.getAddress(), await mid.getAddress()] },
+            { router: await routerB.getAddress(), path: [await mid.getAddress(), await asset.getAddress()] },
+          ],
+        },
+      ],
+    };
+
+    return {
+      deployer,
+      profitWallet,
+      vault,
+      asset,
+      provider: ethers.provider,
+      config,
+      engineAddress: await engine.getAddress(),
+      strategyAddress: await routeStrategy.getAddress(),
+      signer: deployer,
+    };
+  }
+
+  it("prices the Balancer premium at 0 bps (fee override and unknown provider covered)", async function () {
+    const { config, engineAddress, provider } = await loadFixture(balancerFixture);
+    const engine = await ethers.getContractAt("BalancerFlashLoan", engineAddress);
+    const { resolvePremiumBps } = require("../scanner/lib/scan");
+
+    expect(await resolvePremiumBps(config, engine, provider)).to.equal(0n);
+    // governance-fee override knob
+    expect(await resolvePremiumBps({ ...config, flashLoanFeeBps: "7" }, engine, provider)).to.equal(7n);
+    // unknown provider fails loudly instead of silently mispricing
+    await expect(resolvePremiumBps({ ...config, flashLoanProvider: "dydx" }, engine, provider)).to.be
+      .rejected;
+    // aave is the default when unset
+    expect(await resolvePremiumBps({}, engine, provider)).to.equal(5n); // mock-pool fallback
+  });
+
+  it("send mode: confirms the trade and books the exact profit into the profit wallet", async function () {
+    const { config, engineAddress, strategyAddress, provider, signer, profitWallet, vault } =
+      await loadFixture(balancerFixture);
+    const assetAddr = config.opportunities[0].borrowAsset;
+    const asset = await ethers.getContractAt("MockERC20", assetAddr);
+    const vaultBefore = await asset.balanceOf(await vault.getAddress());
+
+    const results = await scanOnce({
+      provider, signer, engineAddress, strategyAddress, config, send: true, log: () => {},
+    });
+
+    expect(results[0].error).to.equal(undefined);
+    expect(results[0].profitable).to.equal(true);
+    expect(results[0].status).to.equal("confirmed");
+    // 0-bps premium: out 1012 - in 1000 = 12, all forwarded to the wallet.
+    expect(BigInt(results[0].eval.premium)).to.equal(0n);
+
+    const engine = await ethers.getContractAt("BalancerFlashLoan", engineAddress);
+    expect(await engine.getBalance(assetAddr)).to.equal(0); // auto-forwarded, engine retains nothing
+    expect(await asset.balanceOf(profitWallet.address)).to.equal(E(12));
+    expect(await asset.balanceOf(await vault.getAddress())).to.equal(vaultBefore); // repaid exactly
+  });
+
+  it("dry-run: simulates via staticCall and sends nothing", async function () {
+    const { config, engineAddress, strategyAddress, provider, signer, profitWallet } =
+      await loadFixture(balancerFixture);
+    const assetAddr = config.opportunities[0].borrowAsset;
+
+    const results = await scanOnce({
+      provider, signer, engineAddress, strategyAddress, config, send: false, log: () => {},
+    });
+
+    expect(results[0].profitable).to.equal(true);
+    expect(results[0].dryRun).to.equal(true);
+    expect(results[0].txHash).to.equal(undefined);
+    const asset = await ethers.getContractAt("MockERC20", assetAddr);
+    expect(await asset.balanceOf(profitWallet.address)).to.equal(0); // nothing moved
+  });
+
+  it("skips unprofitable cycles without sending (parity with the Aave path)", async function () {
+    const { config, engineAddress, strategyAddress, provider, signer, profitWallet } =
+      await loadFixture(balancerFixture);
+    const routerB = await ethers.getContractAt("MockRouter", config.opportunities[0].legs[1].router);
+    await routerB.setBonusBps(0); // opportunity disappears
+
+    const results = await scanOnce({
+      provider, signer, engineAddress, strategyAddress, config, send: true, log: () => {},
+    });
+
+    expect(results[0].profitable).to.equal(false);
+    expect(results[0].txHash).to.equal(undefined);
+    expect(results[0].reasons.join(" ")).to.match(/grossProfit/);
+    const asset = await ethers.getContractAt("MockERC20", config.opportunities[0].borrowAsset);
+    expect(await asset.balanceOf(profitWallet.address)).to.equal(0);
+  });
+});
+
 describe("restore solver (pure gap restoration)", function () {
   const { amountOutFor, solveSwapForTargetRatio, planRestore } = require("../scanner/lib/restore");
 

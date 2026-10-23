@@ -8,35 +8,48 @@
  * Local (default hardhat network): mock Aave pool + two mock venues with a
  * deliberate price gap — fully offline rehearsal of the same flow.
  *
- * Sepolia: REAL Aave V3 pool (WETH reserve, flashLoanEnabled), REAL
- * Uniswap V2 and SushiSwap routers. The market is created by seeding
- * MYTOKEN/WETH pools on both venues at deliberately different prices, so
- * every swap goes through production DEX code with real fees and slippage.
- * The only testnet-specific pieces are the mintable MYTOKEN and the pool
- * seeding (funded by wrapping the signer's Sepolia ETH).
+ * Live networks (see LIVE_NETWORKS below — sepolia, arbitrum): REAL Aave V3
+ * pool (WETH reserve, flashLoanEnabled), REAL Uniswap V2 and SushiSwap
+ * routers. The market is created by seeding MYTOKEN/WETH pools on both
+ * venues at deliberately different prices, so every swap goes through
+ * production DEX code with real fees and slippage. The only venue-specific
+ * pieces are the mintable MYTOKEN and the pool seeding (funded by wrapping
+ * the signer's native ETH).
  *
  * Run:
  *   npx hardhat run scanner/run.js                       (local rehearsal)
+ *   npx hardhat run scanner/run.js --network arbitrum    (LIVE Arbitrum One)
  *   npx hardhat run scanner/run.js --network sepolia     (live testnet run)
+ *
+ * ⚠ On a live network the seed pools hold REAL funds: MYTOKEN is an
+ * open-mint test token, so anyone can mint it and trade against your seeded
+ * WETH. Keep POOL_WETH_ETH tiny on mainnet networks (e.g. 0.01) — this
+ * orchestrator is a plumbing rehearsal, not a production trading mode.
  *
  * Env knobs:
  *   DRY_CYCLES=2     dry-run scan cycles (quote + staticCall, no tx)
  *   SEND_CYCLES=1    send cycles (real transactions)
- *   POOL_WETH_ETH=0.1   WETH seeded per venue on Sepolia
- *   TRADE_WETH_ETH=0.002   flash-loan notional per trade (Sepolia)
+ *   POOL_WETH_ETH=0.1   WETH seeded per venue (lower it on live mainnets!)
+ *   TRADE_WETH_ETH=0.002   flash-loan notional per trade
  *   GAS_RESERVE_ETH=0.05   ETH the signer must keep for gas
  *   RUN_ID=<id>      override the run identifier
  *
  * Profit-safety knobs (see RESULTS.md F1):
- *   GAS_PRICE_FLOOR_WEI   min gas price the gate may assume; default on
- *                         Sepolia is 2 gwei — what a tx actually paid in
- *                         run 8 — so net-negative micro-arbs are skipped.
- *                         GAS_PRICE_FLOOR_WEI=0 restores the old behavior
- *                         (only do that to demonstrate a live send).
- *   SUBMIT_RPC_URL        private submission RPC for sends, e.g.
- *                         https://rpc-sepolia.flashbots.net/ (Flashbots
+ *   GAS_PRICE_FLOOR_WEI   min gas price the gate may assume; defaults per
+ *                         network live in LIVE_NETWORKS (sepolia 2 gwei —
+ *                         what a tx actually paid in run 8; arbitrum 0.05 gwei
+ *                         over the 0.02 gwei chain minimum) so net-negative
+ *                         micro-arbs are skipped. GAS_PRICE_FLOOR_WEI=0
+ *                         restores the old behavior (only to demonstrate a
+ *                         live send).
+ *   SUBMIT_RPC_URL        private submission RPC for sends. Ethereum L1 only:
+ *                         e.g. https://rpc-sepolia.flashbots.net/ (Flashbots
  *                         Protect: hides the tx from the mempool and does
  *                         not include reverting txs -> no gas on failure).
+ *                         Flashbots does NOT support Arbitrum — on 42161 use
+ *                         a provider endpoint with MEV protection
+ *                         (Alchemy/QuickNode) or leave it unset (the
+ *                         sequencer's mempool is already private).
  *   TENDERLY_ACCESS_TOKEN / TENDERLY_ACCOUNT_SLUG / TENDERLY_PROJECT_SLUG
  *                         enable the fail-closed Tenderly preflight before
  *                         every broadcast (see scanner/lib/tenderly.js).
@@ -65,15 +78,41 @@ const { fetchPnl } = require("./lib/ledger");
 const { resolveSendSigner } = require("./lib/submit");
 const { planRestore } = require("./lib/restore");
 
-// Verified live on Sepolia (2026-10-18): pool holds ~0.02 WETH / ~20k USDC,
-// both reserves flashLoanEnabled=true, premium 5 bps, gas ~0.000000019 gwei.
-const SEPOLIA = {
-  aaveProvider: "0x012bAC54348C0E635dCAc9D5FB99f06F24136C9A",
-  weth: "0xC558DBdd856501FCd9aaF1E62eae57A9F0629a3c",
-  uniRouter: "0xeE567Fe1712Faf6149d80dA1E6934E354124CfE3",
-  uniFactory: "0xF62c03E08ada871A0bEb309762E260a7a6a880E6",
-  sushiRouter: "0xeabce3e74ef41fb40024a21cc2ee2f5ddc615791",
-  sushiFactory: "0x734583f62bb6ace3c9ba9bd5a53143ca2ce8c55a",
+// Live-network presets: the REAL Aave V3 market + two REAL
+// Uniswap-V2-codebase venues per network. Every address was verified against
+// the live network RPC before pinning (code presence + cross-checks).
+//
+//   sepolia  — verified live 2026-10-18: pool holds ~0.02 WETH / ~20k USDC,
+//              both reserves flashLoanEnabled=true, premium 5 bps.
+//   arbitrum — verified on-chain 2026-10-23 on Arbitrum One (chainId 42161):
+//              Aave V3 provider 0xa976...3CDb -> Pool 0x794a...14aD, premium
+//              5 bps, WETH reserve ~97.6k WETH; Balancer Vault holds ~103.7
+//              WETH; Uniswap V2 + SushiSwap factories cross-checked via each
+//              router's own factory().
+const LIVE_NETWORKS = {
+  sepolia: {
+    aaveProvider: "0x012bAC54348C0E635dCAc9D5FB99f06F24136C9A",
+    weth: "0xC558DBdd856501FCd9aaF1E62eae57A9F0629a3c",
+    // F1 floor: 2 gwei — the price run 8's live trade actually paid.
+    gasPriceFloorWei: "2000000000",
+    venues: [
+      { name: "uniswapV2", router: "0xeE567Fe1712Faf6149d80dA1E6934E354124CfE3", factory: "0xF62c03E08ada871A0bEb309762E260a7a6a880E6", myPerWeth: 1000n, feeBps: 30 },
+      { name: "sushiswap", router: "0xeabce3e74ef41fb40024a21cc2ee2f5ddc615791", factory: "0x734583f62bb6ace3c9ba9bd5a53143ca2ce8c55a", myPerWeth: 920n, feeBps: 30 },
+    ],
+  },
+  arbitrum: {
+    aaveProvider: "0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb",
+    weth: "0x82aF49447D8a07e3bd95BD0d56f35241523fBab1",
+    // F1 floor: Arbitrum's minimum gas price is 0.02 gwei (on-chain
+    // ArbGasInfo.getMinimumGasPrice); 0.05 gwei keeps margin over
+    // congestion. No separate L1-data line is needed in the gate:
+    // Arbitrum nodes already fold the L1 data fee into eth_estimateGas.
+    gasPriceFloorWei: "50000000",
+    venues: [
+      { name: "uniswapV2", router: "0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24", factory: "0xf1D7CC64Fb4452F05c498126312eBE29f30Fbcf9", myPerWeth: 1000n, feeBps: 30 },
+      { name: "sushiswap", router: "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506", factory: "0xc35DADB65012eC5796536bD9864eD8773aBc74C4", myPerWeth: 920n, feeBps: 30 },
+    ],
+  },
 };
 
 const V2_ROUTER_ABI = [
@@ -95,13 +134,6 @@ const POOL_READ_ABI = [
 ];
 const PAIR_RESERVES_ABI = [
   "function getReserves() view returns (uint112 reserve0, uint112 reserve1, uint32 blockTimestampLast)",
-];
-
-// Seeded venues: MYTOKEN priced at myPerWeth per WETH on each real DEX.
-// The 1000 vs 920 rate is the deliberate ~8.7% price gap the arb trades.
-const VENUES = [
-  { name: "uniswapV2", router: "0xeE567Fe1712Faf6149d80dA1E6934E354124CfE3", factory: "0xF62c03E08ada871A0bEb309762E260a7a6a880E6", myPerWeth: 1000n, feeBps: 30 },
-  { name: "sushiswap", router: "0xeabce3e74ef41fb40024a21cc2ee2f5ddc615791", factory: "0x734583f62bb6ace3c9ba9bd5a53143ca2ce8c55a", myPerWeth: 920n, feeBps: 30 },
 ];
 
 const E = (n) => ethers.parseEther(String(n));
@@ -206,10 +238,12 @@ async function deployMockMarket(deployer) {
 }
 
 /**
- * Live Sepolia market: wrap ETH, deploy the engine against the REAL Aave
- * pool, seed MYTOKEN/WETH pools on both real DEXes at different prices.
+ * Live market on a preset network: wrap ETH, deploy the engine against the
+ * REAL Aave pool, seed MYTOKEN/WETH pools on both real DEXes at different
+ * prices (the 1000 vs 920 rate is the deliberate ~8.7% price gap the arb
+ * trades). `preset` is an entry of LIVE_NETWORKS.
  */
-async function deploySepoliaMarket(deployer, log, onHurdle = null) {
+async function deployLiveMarket(preset, deployer, log, onHurdle = null) {
   const poolWeth = E(process.env.POOL_WETH_ETH ?? "0.1");
   const tradeWeth = E(process.env.TRADE_WETH_ETH ?? "0.002");
   const wrapAmount = poolWeth * 2n + tradeWeth;
@@ -217,7 +251,7 @@ async function deploySepoliaMarket(deployer, log, onHurdle = null) {
 
   // Idempotent: an interrupted run may already hold WETH — only the
   // shortfall has to be wrapped, so only the shortfall must be in ETH.
-  const weth = new ethers.Contract(SEPOLIA.weth, WETH9_ABI, deployer);
+  const weth = new ethers.Contract(preset.weth, WETH9_ABI, deployer);
   const heldWeth = await weth.balanceOf(deployer.address);
   const shortfall = heldWeth >= wrapAmount ? 0n : wrapAmount - heldWeth;
 
@@ -225,14 +259,14 @@ async function deploySepoliaMarket(deployer, log, onHurdle = null) {
   if (ethBal < shortfall + gasReserve) {
     throw new Error(
       `signer ${deployer.address} needs >= ` +
-        `${ethers.formatEther(shortfall + gasReserve)} Sepolia ETH to run the test ` +
+        `${ethers.formatEther(shortfall + gasReserve)} ETH to run the test ` +
         `(have ${ethers.formatEther(ethBal)}): wrap shortfall=` +
         `${ethers.formatEther(shortfall)} (holding ${ethers.formatEther(heldWeth)} WETH) ` +
         `+ gas reserve=${ethers.formatEther(gasReserve)}`
     );
   }
 
-  // All sends below go through sendWait: public Sepolia RPCs may error
+  // All sends below go through sendWait: public RPCs may error
   // AFTER accepting a tx, and each step verifies its on-chain effect.
   const sw = (label, fn, effect) => sendWait(label, fn, effect, { log, onHurdle });
 
@@ -255,11 +289,12 @@ async function deploySepoliaMarket(deployer, log, onHurdle = null) {
     return ethers.getContractAt(factoryName, predicted);
   };
 
-  // 1. Wrap ETH -> WETH (the Aave Sepolia WETH is a WETH9: deposit() works).
+  // 1. Wrap ETH -> WETH (both Aave WETH reserves — Sepolia and Arbitrum —
+  //    are WETH9: deposit() works).
   if (shortfall === 0n) {
     log(`already holding ${ethers.formatEther(heldWeth)} WETH — skipping wrap`);
   } else {
-    log(`wrapping ${ethers.formatEther(shortfall)} ETH -> WETH at ${SEPOLIA.weth}`);
+    log(`wrapping ${ethers.formatEther(shortfall)} ETH -> WETH at ${preset.weth}`);
     await sw(
       "wrap-eth",
       () => weth.deposit({ value: shortfall }),
@@ -278,7 +313,7 @@ async function deploySepoliaMarket(deployer, log, onHurdle = null) {
   }
 
   // Top up the GTT the two venues will be seeded with (open mint — test token).
-  const gttNeeded = poolWeth * VENUES.reduce((acc, v) => acc + v.myPerWeth, 0n);
+  const gttNeeded = poolWeth * preset.venues.reduce((acc, v) => acc + v.myPerWeth, 0n);
   const gttHeld = await mytoken.balanceOf(deployer.address);
   if (gttHeld < gttNeeded) {
     const gttShort = gttNeeded - gttHeld;
@@ -294,7 +329,7 @@ async function deploySepoliaMarket(deployer, log, onHurdle = null) {
   // 3. Engine + strategy against the REAL Aave pool via its real provider.
   //    Resume support: ENGINE_ADDRESS / ROUTE_STRATEGY_ADDRESS reuse a prior
   //    deployment instead of paying to deploy again.
-  const providerAddr = process.env.POOL_ADDRESSES_PROVIDER || SEPOLIA.aaveProvider;
+  const providerAddr = process.env.POOL_ADDRESSES_PROVIDER || preset.aaveProvider;
   let engine;
   if (process.env.ENGINE_ADDRESS) {
     engine = await ethers.getContractAt("FlashLoan", process.env.ENGINE_ADDRESS);
@@ -325,27 +360,27 @@ async function deploySepoliaMarket(deployer, log, onHurdle = null) {
       () => engine.isStrategy(strategyAddress)
     );
   }
-  for (const r of [SEPOLIA.uniRouter, SEPOLIA.sushiRouter]) {
+  for (const r of preset.venues.map((v) => v.router)) {
     if (!(await strategy.trustedRouter(r))) {
       await sw(`trust-router-${r}`, () => strategy.setTrustedRouter(r, true));
     }
   }
 
-  // 4. Seed both venues with MYTOKEN/WETH pools at different prices:
-  //    venue A prices MYTOKEN at 1000/WETH, venue B at 920/WETH -> ~8.7% gap.
-  const venues = VENUES.map((v) => ({ ...v }));
+  // 4. Seed both venues with MYTOKEN/WETH pools at different prices per the
+  //    preset (1000/WETH on venue A, 920/WETH on venue B -> ~8.7% gap).
+  const venues = preset.venues.map((v) => ({ ...v }));
   const deadline = Math.floor(Date.now() / 1000) + 600;
   for (const v of venues) {
     const factory = new ethers.Contract(v.factory, V2_FACTORY_ABI, deployer);
-    let pair = await factory.getPair(myAddr, SEPOLIA.weth);
+    let pair = await factory.getPair(myAddr, preset.weth);
     if (pair === ethers.ZeroAddress) {
       log(`${v.name}: creating MYTOKEN/WETH pair on factory ${v.factory}`);
       await sw(
         `${v.name}-create-pair`,
-        () => factory.createPair(myAddr, SEPOLIA.weth),
-        async () => (await factory.getPair(myAddr, SEPOLIA.weth)) !== ethers.ZeroAddress
+        () => factory.createPair(myAddr, preset.weth),
+        async () => (await factory.getPair(myAddr, preset.weth)) !== ethers.ZeroAddress
       );
-      pair = await factory.getPair(myAddr, SEPOLIA.weth);
+      pair = await factory.getPair(myAddr, preset.weth);
     }
     const myAmount = poolWeth * v.myPerWeth; // poolWeth tokens per WETH, in token wei
     const router = new ethers.Contract(v.router, V2_ROUTER_ABI, deployer);
@@ -369,7 +404,7 @@ async function deploySepoliaMarket(deployer, log, onHurdle = null) {
       `${v.name}-add-liquidity`,
       () =>
         router.addLiquidity(
-          myAddr, SEPOLIA.weth, myAmount, poolWeth, myAmount, poolWeth, deployer.address, deadline
+          myAddr, preset.weth, myAmount, poolWeth, myAmount, poolWeth, deployer.address, deadline
         ),
       seeded
     );
@@ -384,7 +419,7 @@ async function deploySepoliaMarket(deployer, log, onHurdle = null) {
   return {
     engineAddress,
     strategyAddress,
-    asset: SEPOLIA.weth, // borrowed asset == wrapped native -> gas netting is live
+    asset: preset.weth, // borrowed asset == wrapped native -> gas netting is live
     mid: myAddr,
     venueA: { name: venues[0].name, router: venues[0].router, pair: venues[0].pair },
     venueB: { name: venues[1].name, router: venues[1].router, pair: venues[1].pair },
@@ -616,7 +651,9 @@ async function restoreGap({ deployer, market, log, record, onHurdle }) {
 
 async function main() {
   const network = hre.network.name;
-  const isSepolia = network === "sepolia";
+  // Live mode exists only for networks with a preset (real Aave market +
+  // real venues); every other network rehearses against local mocks.
+  const live = LIVE_NETWORKS[network];
   const [deployer] = await hre.ethers.getSigners();
   if (!deployer) {
     throw new Error(
@@ -633,10 +670,10 @@ async function main() {
   };
 
   const dryCycles = Number(process.env.DRY_CYCLES ?? 2);
-  const sendCycles = Number(process.env.SEND_CYCLES ?? (isSepolia ? 1 : 1));
+  const sendCycles = Number(process.env.SEND_CYCLES ?? 1);
   const restoreEnabled = process.env.RESTORE_GAP === "true";
   const abortBelowWei = ethers.parseEther(process.env.ABORT_BELOW_ETH ?? "0.2");
-  const mode = isSepolia ? "SEPOLIA (real Aave pool + real DEX routers)" : "local mock market";
+  const mode = live ? `${network.toUpperCase()} (real Aave pool + real DEX routers)` : "local mock market";
 
   log(`run ${runId} -> ${run.file}`);
   log(`mode: ${mode}`);
@@ -656,8 +693,8 @@ async function main() {
 
   // --- market -------------------------------------------------------------
   log("== setup ==");
-  const market = isSepolia
-    ? await deploySepoliaMarket(deployer, log, onHurdle)
+  const market = live
+    ? await deployLiveMarket(live, deployer, log, onHurdle)
     : await deployMockMarket(deployer);
 
   const deployBlock = await ethers.provider.getBlockNumber();
@@ -708,10 +745,15 @@ async function main() {
     defaultSlippageBps: 100,
     defaultMinProfitWei: "0",
     wrappedNativeAsset: market.asset,
-    // F1 fix: price gas at max(feeData, floor). Sepolia's default floor is
-    // 2 gwei — the price the live trade in run 8 actually paid — so the
-    // gate can never approve a money-losing cycle (RESULTS.md F1/F4).
-    gasPriceFloorWei: process.env.GAS_PRICE_FLOOR_WEI || (isSepolia ? "2000000000" : "0"),
+    // This orchestrator always deploys the Aave engine (MockPool locally,
+    // the real Aave pool on live networks) — declare the provider so the premium
+    // is priced from FLASHLOAN_PREMIUM_TOTAL, not the Balancer 0-bps default.
+    flashLoanProvider: "aave",
+    // F1 fix: price gas at max(feeData, floor). Per-network defaults live in
+    // LIVE_NETWORKS (sepolia 2 gwei — the price the live trade in run 8
+    // actually paid; arbitrum 0.05 gwei over the 0.02 gwei chain floor) so
+    // the gate can never approve a money-losing cycle (RESULTS.md F1/F4).
+    gasPriceFloorWei: process.env.GAS_PRICE_FLOOR_WEI || (live ? live.gasPriceFloorWei : "0"),
     // Campaign knob (see header): NET_PROFIT_ON_CHAIN=false keeps the
     // on-chain minProfit at the gross floor — a deliberate, recorded
     // relaxation for volume runs.

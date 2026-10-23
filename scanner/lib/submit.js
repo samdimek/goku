@@ -6,13 +6,18 @@
  *
  *  - submitRpcUrl unset            -> keep the given signer (public mempool).
  *  - submitRpcUrl set + PRIVATE_KEY -> a Wallet connected to the private
- *    submission RPC. Flashbots Protect (Sepolia: https://rpc-sepolia.flashbots.net/,
- *    mainnet: https://rpc.flashbots.net/fast) accepts standard
- *    eth_sendRawTransaction and, by default, does NOT include reverting
- *    transactions (canRevert is off) -> a trade that would revert never
- *    lands, so no gas is paid for it. It also hides the tx from the public
- *    mempool (sandwich-bot protection). The endpoint must serve standard
- *    read methods too (Protect does — it is used as a wallet custom RPC).
+ *    submission RPC. Ethereum L1 only: Flashbots Protect (Sepolia:
+ *    https://rpc-sepolia.flashbots.net/, mainnet: https://rpc.flashbots.net/fast)
+ *    accepts standard eth_sendRawTransaction and, by default, does NOT
+ *    include reverting transactions (canRevert is off) -> a trade that would
+ *    revert never lands, so no gas is paid for it. It also hides the tx from
+ *    the public mempool (sandwich-bot protection). The endpoint must serve
+ *    standard read methods too (Protect does — it is used as a wallet custom
+ *    RPC). Flashbots does NOT support Arbitrum (chainId 42161): on Arbitrum
+ *    the sequencer's mempool is already private and MEV protection is a
+ *    provider feature (e.g. Alchemy/QuickNode Arbitrum endpoints with MEV
+ *    protection enabled) — point SUBMIT_RPC_URL at such an endpoint, or
+ *    leave it empty to submit through the normal RPC.
  *  - submitRpcUrl set, no key      -> cannot sign remotely; keep the given
  *    signer and say so (loudly) — never silently downgrade.
  *
